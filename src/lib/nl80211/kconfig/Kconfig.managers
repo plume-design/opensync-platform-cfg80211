@@ -1,0 +1,5 @@
+menuconfig NL80211_INTERFACE_LAYER
+    bool "NL80211 interface abstraction layer"
+    default y
+    help
+        Enable NL80211 interface abstraction layer

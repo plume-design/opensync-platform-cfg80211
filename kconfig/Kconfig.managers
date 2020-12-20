@@ -1,0 +1,2 @@
+comment "Platform Managers"
+rsource "../src/lib/nl80211/kconfig/Kconfig.managers"
