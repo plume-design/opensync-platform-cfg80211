@@ -154,6 +154,9 @@ static struct schema_Wifi_VIF_Config *g_vconfs;
 static int g_num_rconfs;
 static int g_num_vconfs;
 
+static bool
+util_radio_country_get(const char *phy, char *country, int country_len);
+
 /******************************************************************************
  * Generic helpers
  *****************************************************************************/
@@ -1490,6 +1493,7 @@ qca_ctrl_discover(const char *bss)
         hapd->ieee80211n = 1;
         hapd->ieee80211ac = 1;
         hapd->ieee80211ax = 0;
+        util_radio_country_get(phy, hapd->country, sizeof(hapd->country));
         ctrl_enable(&hapd->ctrl);
         hapd = NULL;
     }
@@ -3434,7 +3438,7 @@ util_radio_ht_mode_get(char *phy, char *htmode, int htmode_len)
 static bool
 util_radio_country_get(const char *phy, char *country, int country_len)
 {
-    char buf[256];
+    char buf[32];
     char *p;
     int err;
 
@@ -3445,8 +3449,6 @@ util_radio_country_get(const char *phy, char *country, int country_len)
     }
 
     strscpy(country, buf, country_len);
-
-    LOGT("[%s %d] Country[%s]", __func__, __LINE__, country);
 
     return strlen(country);
 }
