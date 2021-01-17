@@ -58,6 +58,7 @@ ovs-vsctl set int br-wan mtu_request=1500
 echo "Adding br-home with MAC address $MAC_ETH1"
 ovs-vsctl add-br br-lan
 ovs-vsctl set bridge br-lan other-config:hwaddr="$MAC_ETH1"
+ovs-vsctl add-port br-lan eth0
 
 echo "Enabling LAN interface eth1"
 ifconfig eth1 up
