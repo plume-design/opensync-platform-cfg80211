@@ -118,17 +118,6 @@ identify_chip(const char *phyname,
      */
     is_da_maybe = access(path_base, X_OK) != 0;
     if (is_da_maybe) {
-        /* Only qca_da should have this wext ioctl. If it doesn't the
-         * subsequent code is invalid so bail out.
-         */
-#if 0
-        /*
-         * The issue specific to "getAMPDU" command is fixed in
-         * the driver so this code is not required.
-         */
-        if (WARN_ON(!strexa("iwpriv", ifname, "getAMPDU")))
-            return -1;
-#endif
         if (WARN_ON(glob("/sys/devices/platform/*.wifi/of_node/compatible", 0, NULL, &g)))
             return -1;
 

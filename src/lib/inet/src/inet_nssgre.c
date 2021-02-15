@@ -106,20 +106,6 @@ bool inet_nssgre_check(void)
         return false;
     }
 
-    /* Check qca-nss-gre */
-    if (stat("/sys/module/qca_nss_gre", &st) != 0 || !S_ISDIR(st.st_mode))
-    {
-        LOG(CRIT, "NSSGRE: Required module qca-nss-gre.ko not loaded.");
-        return false;
-    }
-
-    /* Check for qca-nss-gre-test */
-    if (stat("/sys/module/qca_nss_gre_test", &st) != 0 || !S_ISDIR(st.st_mode))
-    {
-        LOG(CRIT, "NSSGRE: Required module qca-nss-gre-test.ko not loaded.");
-        return false;
-    }
-
     /*
      * Check if NSS offload is enabled
      */
@@ -132,15 +118,6 @@ bool inet_nssgre_check(void)
     if (fread_int("/proc/sys/dev/nss/general/redirect", 0) != 1)
     {
         LOG(CRIT, "NSSGRE: Unable to verify NSS redirect status: /proc/sys/dev/nss/general/redirect");
-        return false;
-    }
-
-    /*
-     * Check if Wifi offload is enabled
-     */
-    if (fread_int("/sys/module/qca_ol/parameters/nss_wifi_olcfg", 0) <= 0)
-    {
-        LOG(CRIT, "NSSGRE: Unable to verify NSS offload status: /sys/module/qca_ol/parameters/nss_wifi_olcfg");
         return false;
     }
 

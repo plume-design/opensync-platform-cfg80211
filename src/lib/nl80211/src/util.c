@@ -25,7 +25,34 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #define _GNU_SOURCE
-#include "target_nl80211.h"
+#include "nl80211.h"
+
+void mac_dump(char *mac_addr, const unsigned char *arg)
+{
+        sprintf(mac_addr, "%02x:%02x:%02x:%02x:%02x:%02x",
+                arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]);
+}
+
+int util_get_temp_info(const char *ifname)
+{
+    char path_temp[120] = { 0 };
+    const char *buf_temp;
+
+    if (strcmp(ifname, "wlan0") == 0)
+        snprintf(path_temp, sizeof(path_temp), "/sys/class/net/%s/device/hwmon/hwmon0/temp1_input", ifname);
+    else if(strcmp(ifname, "wlan1") == 0)
+        snprintf(path_temp, sizeof(path_temp), "/sys/class/net/%s/device/hwmon/hwmon1/temp1_input", ifname);
+    else if(strcmp(ifname, "wlan2") == 0)
+        snprintf(path_temp, sizeof(path_temp), "/sys/class/net/%s/device/hwmon/hwmon2/temp1_input", ifname);
+    else
+        return -EINVAL;
+
+    buf_temp = strexa("cat", path_temp);
+    if (!buf_temp)
+        return -EINVAL;
+
+    return strtol(buf_temp, 0, 10);
+}
 
 int util_sys_ifname_to_idx(const char *ifname)
 {
@@ -109,6 +136,53 @@ int util_ht_mode(enum nl80211_chan_width chanwidth, char *ht_mode, int len)
             break;
         case NL80211_CHAN_WIDTH_160:
             strscpy(ht_mode, "HT160", len);
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+bool util_mode(enum nl80211_iftype type, char *mode, int len)
+{
+    switch (type) {
+        case NL80211_IFTYPE_UNSPECIFIED:
+            return false;
+        case NL80211_IFTYPE_ADHOC:
+            strscpy(mode, "adhoc", len);
+            break;
+        case NL80211_IFTYPE_STATION:
+            strscpy(mode, "sta", len);
+            break;
+        case NL80211_IFTYPE_AP:
+            strscpy(mode, "ap", len);
+            break;
+        case NL80211_IFTYPE_AP_VLAN:
+            strscpy(mode, "ap_vlan", len);
+            break;
+        case NL80211_IFTYPE_WDS:
+            strscpy(mode, "wds", len);
+            break;
+        case NL80211_IFTYPE_MONITOR:
+            strscpy(mode, "moni", len);
+            break;
+        case NL80211_IFTYPE_MESH_POINT:
+            strscpy(mode, "mesh", len);
+            break;
+        case NL80211_IFTYPE_P2P_CLIENT:
+            strscpy(mode, "p2p_cli", len);
+            break;
+        case NL80211_IFTYPE_P2P_GO:
+            strscpy(mode, "p2p_go", len);
+            break;
+        case NL80211_IFTYPE_P2P_DEVICE:
+            strscpy(mode, "p2p_device", len);
+            break;
+        case NL80211_IFTYPE_OCB:
+            strscpy(mode, "ocb", len);
+            break;
+        case NL80211_IFTYPE_NAN:
+            strscpy(mode, "nan", len);
             break;
         default:
             return false;

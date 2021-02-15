@@ -24,33 +24,23 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-/*
- * ieee80211 private ioctl interface
- */
+#include <stdbool.h>
+#include <stdio.h>
+#include <errno.h>
 
-#ifndef IOCTL80211_PRIV_H_INCLUDED
-#define IOCTL80211_PRIV_H_INCLUDED
+#include "target.h"
 
-/***************************************************************************************/
+#define MODULE_ID LOG_MODULE_ID_TARGET
 
-typedef void*   ioctl80211_priv_t;
 
-/***************************************************************************************/
+/******************************************************************************
+ *  TARGET definitions
+ *****************************************************************************/
 
-extern ioctl80211_priv_t    ioctl80211_priv_init(const char *ifname, int fd);
-extern void                 ioctl80211_priv_free(ioctl80211_priv_t priv);
+struct ev_loop *target_mainloop;
 
-extern bool                 ioctl80211_priv_set_int(ioctl80211_priv_t priv,
-                                            const char *cmd, uint32_t *vals, int nvals);
-extern bool                 ioctl80211_priv_get_int(ioctl80211_priv_t priv,
-                                           const char *cmd, uint32_t *vals, int *nvals);
-
-extern bool                 ioctl80211_priv_set(ioctl80211_priv_t priv,
-                                                   const char *cmd, void *buf, int len);
-extern bool                 ioctl80211_priv_get(ioctl80211_priv_t priv,
-                                                 const char *cmd, void *dest, int *len);
-
-extern uint32_t             ioctl80211_priv_get_inum(ioctl80211_priv_t priv,
-                                                                       const char *cmd);
-
-#endif /* IOCTL80211_PRIV_H_INCLUDED */
+bool target_init(target_init_opt_t opt, struct ev_loop *loop)
+{
+    target_mainloop = loop;
+    return true;
+}

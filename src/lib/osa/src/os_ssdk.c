@@ -31,9 +31,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 bool os_ssdk_is_available(void)
 {
-    if (access("/sys/module/qca_ssdk", F_OK) != 0)
-        return false;
-
     if (access("/dev/switch_ssdk", F_OK) != 0)
         return false;
 

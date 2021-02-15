@@ -24,53 +24,83 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include <ev.h>                 // libev routines
-#include <getopt.h>             // command line arguments
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <errno.h>
 
-#include "log.h"                // logging routines
-#include "target.h"             // target API
+#include "log.h"
 
-#include "target_nl80211.h"    // module header
-
-static log_severity_t  log_severity = LOG_SEVERITY_INFO;
-
-#define MODULE_ID LOG_MODULE_ID_MAIN
-
-int main(int argc, char ** argv)
+int32_t hextonum(char c)
 {
-    struct ev_loop *loop = EV_DEFAULT;
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
 
-    if (os_get_opt(argc, argv, &log_severity))
-    {
-        return -1;
+int hextobin(const char *hex, size_t h_len, uint8_t *binbuf, size_t *b_len)
+{
+    size_t i;
+    int a;
+    int b1;
+    int b2;
+    const char *h_pos = hex;
+    uint8_t *b_pos = binbuf;
+    *b_len = 0;
+
+    for (i = 0; i < h_len; i++) {
+        b1 = hextonum(*h_pos++);
+        if (b1 < 0)
+            return -1;
+        b2 = hextonum(*h_pos++);
+        if (b2 < 0)
+            return -1;
+        a = (b1 << 4) | b2;
+        if (a < 0)
+            return -1;
+        *b_pos++ = a;
+        (*b_len)++;
     }
-
-    target_log_open("OPENSYNC_CFG80211", 0);
-    LOGN("Initializing OPENSYNC_CFG80211");
-    log_severity_set(log_severity);
-    log_register_dynamic_severity(loop);
-
-    backtrace_init();
-
-    json_memdbg_init(loop);
-
-    // TODO: Fix - Initialize target structure
-    if (!target_init(TARGET_INIT_MGR_HELLO_WORLD, loop))
-    {
-        LOGE("Initializing HELLO NL80211 "
-             "(Failed to initialize target library)");
-        return -1;
-    }
-
-    target_nl80211_init(loop);
-
-    ev_run(loop, 0);
-
-    target_close(TARGET_INIT_MGR_HELLO_WORLD, loop);
-
-    ev_loop_destroy(loop);
-
-    LOGN("Exiting OPENSYNC_CFG80211");
 
     return 0;
+}
+
+int bintohex(const uint8_t *binbuf, size_t isize, char *hexbuf, size_t osize)
+{
+    char *p;
+    int i;
+
+    if (osize < (isize * 2 + 1))
+        return -1;
+
+    memset(hexbuf, 0, osize);
+    p = &hexbuf[0];
+
+    for (i = 0; i < isize; i++)
+        p += sprintf(p, "%02hhx", binbuf[i]);
+
+    return 0;
+}
+
+int util_wifi_get_parent(const char *vif, char *buf, int len)
+{
+    char p_buf[32] = {0};
+
+    if (util_get_vif_radio(vif, p_buf, sizeof(p_buf))) {
+        LOGW("%s: failed to get vif radio", vif);
+        return -EINVAL;
+    }
+    strscpy(buf, p_buf, len);
+
+    return 0;
+}
+
+bool util_wifi_is_phy_vif_match(const char *phy, const char *vif)
+{
+    char buf[32];
+    util_wifi_get_parent(vif, buf, sizeof(buf));
+    return !strcmp(phy, buf);
 }

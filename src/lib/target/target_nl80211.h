@@ -24,19 +24,21 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef IOCTL80211_RADIO_H_INCLUDED
-#define IOCTL80211_RADIO_H_INCLUDED
+#ifndef TARGET_NETLINK_H_INCLUDED
+#define TARGET_NETLINK_H_INCLUDED
 
-#include "ioctl80211_api.h"
+extern struct ev_loop *target_mainloop;
+extern bool nl80211_client_stats_convert(radio_entry_t *, target_client_record_t *, target_client_record_t *, dpp_client_record_t *);
+extern bool nl80211_stats_clients_get(radio_entry_t *, radio_essid_t *, target_stats_clients_cb_t *, ds_dlist_t *, void *);
+extern bool nl80211_stats_survey_get(radio_entry_t *, uint32_t *, uint32_t, radio_scan_type_t, target_stats_survey_cb_t *,
+                             ds_dlist_t *, void *survey_ctx);
+extern bool nl80211_stats_survey_convert(radio_entry_t *, radio_scan_type_t,
+                                 target_survey_record_t *, target_survey_record_t *,
+                                 dpp_survey_record_t *);
+extern bool nl80211_stats_scan_start(radio_entry_t *, uint32_t *, uint32_t, radio_scan_type_t, int32_t,
+                                     target_scan_cb_t *, void *);
+extern bool nl80211_stats_scan_stop(radio_entry_t *, radio_scan_type_t);
+extern bool nl80211_stats_scan_get(radio_entry_t *, uint32_t *, uint32_t,
+                           radio_scan_type_t, dpp_neighbor_report_data_t *);
 
-int ioctl80211_radio_init();
-
-ioctl_status_t ioctl80211_radio_tx_stats_enable(
-        radio_entry_t              *radio_cfg,
-        bool                        status);
-
-ioctl_status_t ioctl80211_radio_fast_scan_enable(
-        radio_entry_t              *radio_cfg,
-        ifname_t                    if_name);
-
-#endif /* IOCTL80211_RADIO_H_INCLUDED */
+#endif /* TARGET_NETLINK_H_INCLUDED */

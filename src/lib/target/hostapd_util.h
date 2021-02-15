@@ -24,18 +24,25 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#define _GNU_SOURCE
 #ifndef HOSTAPD_UTIL_H_INCLUDED
 #define HOSTAPD_UTIL_H_INCLUDED
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #define HOSTAPD_CONTROL_PATH_DEFAULT "/var/run"
+#define EXEC(...) strexa(__VA_ARGS__)
+#define CMD_TIMEOUT(...) "timeout", "-s", "KILL", "3", ## __VA_ARGS__
+#define HOSTAPD_CLI(sockdir, vif, ...) EXEC(CMD_TIMEOUT("hostapd_cli", "-p", sockdir, "-i", vif, ## __VA_ARGS__))
 
-bool hostapd_client_disconnect(const char *path, const char *interface, const char *disc_type,
+#define SSID_MAX_LEN 32
+
+bool hostapd_client_disconnect(const char *interface, const char *disc_type,
                                const char *mac_str, uint8_t reason);
-bool hostapd_btm_request(const char *path, const char *interface, const char *btm_req_cmd);
-bool hostapd_rrm_set_neighbor(const char *path, const char *interface, const char *bssid, const char *nr);
-bool hostapd_rrm_remove_neighbor(const char *path, const char *interface, const char *bssid);
+bool hostapd_btm_request(const char *interface, const char *btm_req_cmd);
+bool hostapd_rrm_set_neighbor(const char *interface, const char *bssid, const char *hex_ssid, const char *nr);
+bool hostapd_rrm_remove_neighbor(const char *interface, const char *bssid);
 
 #endif /* HOSTAPD_UTIL_H_INCLUDED */

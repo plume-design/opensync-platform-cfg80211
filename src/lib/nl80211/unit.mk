@@ -36,17 +36,19 @@ UNIT_TYPE := LIB
 UNIT_SRC := src/util.c
 UNIT_SRC += src/nl_util.c
 UNIT_SRC += src/target_nl80211.c
+UNIT_SRC += src/stats_nl80211.c
+UNIT_SRC += src/stats_util.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
-UNIT_CFLAGS += -I$(TOP_DIR)/src/lib/common/inc/
 UNIT_CFLAGS += -I$(STAGING_DIR)/usr/include/libnl3/
+UNIT_CFLAGS += -Isrc/lib/datapipeline/inc
 
 #UNIT_LDFLAGS := -lev -lnl-tiny
-UNIT_LDFLAGS := -lev -lnl-3 -lnl-genl-3
+UNIT_LDFLAGS := -lev -lnl-3 -lnl-genl-3 -lubox
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
 UNIT_EXPORT_LDFLAGS := $(UNIT_LDFLAGS)
 
-# TODO: Remove support to build as independent binary
-#UNIT_SRC += src/nl80211_main.c
-#UNIT_DEPS += src/lib/ovsdb
+UNIT_DEPS += src/lib/ds
+UNIT_DEPS += src/lib/common
+UNIT_DEPS += src/lib/schema

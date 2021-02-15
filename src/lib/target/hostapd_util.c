@@ -24,23 +24,28 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 
 #include "os.h"
 #include "log.h"
 #include "hostapd_util.h"
+#include "dpp_types.h"
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
 
-bool hostapd_client_disconnect(const char *path, const char *interface, const
-                               const char *disc_type, const char *mac_str, uint8_t reason)
+bool hostapd_client_disconnect(const char *vif, const char *disc_type, const char *mac_str, uint8_t reason)
 {
     char hostapd_cmd[512];
     bool ret = false;
+    char phy[32];
+
+    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
+        return false;
 
     snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-             "timeout -t 5 hostapd_cli -p %s/hostapd-$(cat /sys/class/net/%s/parent) -i %s %s %s reason=%hhu",
-             path, interface, interface, disc_type, mac_str, reason);
+             "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s %s %s reason=%hhu",
+             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, disc_type, mac_str, reason);
 
     ret = !cmd_log(hostapd_cmd);
     if (!ret) {
@@ -50,33 +55,18 @@ bool hostapd_client_disconnect(const char *path, const char *interface, const
     return ret;
 }
 
-bool hostapd_btm_request(const char *path, const char *interface, const char *btm_req_cmd)
+bool hostapd_btm_request(const char *vif, const char *btm_req_cmd)
 {
     char    hostapd_cmd[1024];
     bool    ret = false;
+    char    phy[32];
+
+    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
+        return false;
 
     snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -t 5 hostapd_cli -p %s/hostapd-$(cat /sys/class/net/%s/parent) -i %s bss_tm_req %s",
-            path, interface, interface, btm_req_cmd);
-
-    ret = !cmd_log(hostapd_cmd);
-    if (!ret) {
-        LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
-    }
-
-
-    return ret;
-}
-
-bool hostapd_rrm_set_neighbor(const char *path, const char *interface, const char *bssid, const char *nr)
-{
-    char    hostapd_cmd[1024];
-    bool    ret = false;
-
-    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -t 5 hostapd_cli -p %s/hostapd-$(cat /sys/class/net/%s/parent) -i %s "
-            "set_neighbor %s nr=%s",
-            path, interface, interface, bssid, nr);
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s bss_tm_req %s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, btm_req_cmd);
 
     ret = !cmd_log(hostapd_cmd);
     if (!ret) {
@@ -86,18 +76,92 @@ bool hostapd_rrm_set_neighbor(const char *path, const char *interface, const cha
     return ret;
 }
 
-bool hostapd_rrm_remove_neighbor(const char *path, const char *interface, const char *bssid)
+bool hostapd_rrm_beacon_report_request(const char *vif,
+                                       const char *mac_addr,
+                                       const char *req_hex_buf)
 {
     char    hostapd_cmd[1024];
     bool    ret = false;
+    char    phy[32];
+
+    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
+        return false;
 
     snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -t 5 hostapd_cli -p %s/hostapd-$(cat /sys/class/net/%s/parent) -i %s "
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
+            "req_beacon %s %s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac_addr, req_hex_buf);
+
+    ret = !cmd_log(hostapd_cmd);
+    if (!ret)
+        LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+
+    return ret;
+}
+
+bool hostapd_rrm_set_neighbor(const char *vif, const char *bssid, const char *hex_ssid, const char *nr)
+{
+    char    hostapd_cmd[1024];
+    bool    ret = false;
+    char    phy[32];
+
+    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
+        return false;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
+            "set_neighbor %s ssid=%s nr=%s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, bssid, hex_ssid, nr);
+
+    ret = !cmd_log(hostapd_cmd);
+    if (!ret) {
+        LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+    }
+
+    return ret;
+}
+
+bool hostapd_rrm_remove_neighbor(const char *vif, const char *bssid)
+{
+    char    hostapd_cmd[1024];
+    bool    ret = false;
+    char    phy[32];
+
+    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
+        return false;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
             "remove_neighbor %s ",
-            path, interface, interface, bssid);
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, bssid);
 
     ret = !cmd_log(hostapd_cmd);
     if (!ret) {
+        LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+    }
+
+    return ret;
+}
+
+bool hostapd_acl_update(const char *vif, const uint8_t *mac_addr, int add)
+{
+    char hostapd_cmd[1024];
+    bool ret = true;
+    bool status;
+    char phy[32];
+
+    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
+        return false;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
+            "DENY_ACL %s "MAC_ADDRESS_FORMAT,
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
+            add ? "DEL_MAC" : "ADD_MAC", MAC_ADDRESS_PRINT(mac_addr));
+
+    status = !cmd_log(hostapd_cmd);
+    if (!status) {
+        ret = false;
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
 

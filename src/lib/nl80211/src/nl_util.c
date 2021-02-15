@@ -42,7 +42,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <fcntl.h>
 #include <errno.h>
 
-#include "target_nl80211.h"
+#include "nl80211.h"
 
 int nl_resp_parse_mcast_id(struct nl_msg *msg, void *arg)
 {
@@ -145,6 +145,7 @@ int nlmsg_send_and_recv(struct nl_global_info *nl_global,
 {
     struct nl_cb *cb;
     int err;
+    int ret;
 
     if (!msg)
         return -ENOMEM;
@@ -167,9 +168,11 @@ int nlmsg_send_and_recv(struct nl_global_info *nl_global,
     if (handler)
         nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, handler, arg);
 
-    while (err > 0)
-        nl_recvmsgs(nl_global->nl_msg_handle, cb);
-
+    while (err > 0) {
+        ret = nl_recvmsgs(nl_global->nl_msg_handle, cb);
+        if (ret < 0)
+            LOGI("%s: nl_recvmsgs failed: %d (%s)", __func__, ret, nl_geterror(ret));
+    }
 out:
     nlmsg_free(msg);
     nl_cb_put(cb);
@@ -221,7 +224,7 @@ int netlink_init(struct nl_global_info *nl_global)
 
     /* Socket handler for events */
     nl_global->nl_evt_handle = nl_socket_alloc_cb(nl_global->nl_cb);
-    if (nl_global->nl_msg_handle == NULL) {
+    if (nl_global->nl_evt_handle == NULL) {
         LOGT("Failed to allocate event callback handle");
         goto out;
     }

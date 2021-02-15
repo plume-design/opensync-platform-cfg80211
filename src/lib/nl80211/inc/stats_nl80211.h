@@ -24,35 +24,41 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef IOCTL80211_H_INCLUDED
-#define IOCTL80211_H_INCLUDED
+#ifndef STATS_NETLINK_H_INCLUDED
+#define STATS_NETLINK_H_INCLUDED
 
-#include <sys/socket.h>
-#include <linux/types.h>
-#include <linux/wireless.h>
+#include "dpp_client.h"
+#include "dpp_survey.h"
 
-//#include <cfg80211_nlwrapper_api.h>
-#include "ioctl80211_api.h"
 
-static inline
-int ioctl80211_get_iwp(struct iw_event *iwe, struct iw_point *iwp)
+typedef struct {
+    DPP_TARGET_CLIENT_RECORD_COMMON_STRUCT;
+    dpp_client_stats_t  stats;
+} target_client_record_t;
+
+typedef struct
 {
-    struct {
-        __u16 length;
-        __u16 flags;
-        char payload[0];
-    } *ptr;
+    DPP_TARGET_SURVEY_RECORD_COMMON_STRUCT;
+    uint32_t chan_active;
+    uint32_t chan_busy;
+    uint32_t chan_busy_ext;
+    uint32_t chan_self;
+    uint32_t chan_rx;
+    uint32_t chan_tx;
+    uint32_t chan_noise;
+    uint32_t duration_ms;
+} target_survey_record_t;
 
-    ptr = (void *)iwe + IW_EV_LCP_LEN;
-    iwp->pointer = ptr->payload;
-    iwp->length = ptr->length;
-    iwp->flags = ptr->flags;
-
-    if (iwp->length > (iwe->len - IW_EV_POINT_LEN)) {
-        return (-1);
-    }
-
-    return (0);
+static inline void target_client_record_free(target_client_record_t *record)
+{
+    if (NULL != record)
+        free(record);
 }
 
-#endif /* IOCTL80211_H_INCLUDED */
+static inline void target_survey_record_free(target_survey_record_t *record)
+{
+    if (NULL != record)
+        free(record);
+}
+
+#endif /* STATS_NETLINK_H_INCLUDED */

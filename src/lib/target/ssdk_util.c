@@ -32,8 +32,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "os.h"
 #include "log.h"
 
-#define INTERFACE1 "eth0"
-#define INTERFACE2 "eth1"
+#define INTERFACE1 CONFIG_TARGET_ETH0_NAME
+#define INTERFACE2 CONFIG_TARGET_ETH1_NAME
 
 /*
  * Sample input below:

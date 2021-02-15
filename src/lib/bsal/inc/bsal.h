@@ -24,19 +24,30 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef IOCTL80211_DEVICE_H_INCLUDED
-#define IOCTL80211_DEVICE_H_INCLUDED
+#ifndef BSAL_H_INCLUDED
+#define BSAL_H_INCLUDED
+#include "target_bsal.h"
 
-#include "dpp_device.h"
+int     nl_bsal_init(bsal_event_cb_t event_cb, struct ev_loop *loop);
+int     nl_bsal_cleanup(void);
 
-#include "ioctl80211_api.h"
+int     nl_bsal_iface_add(const bsal_ifconfig_t *ifcfg);
+int     nl_bsal_iface_update(const bsal_ifconfig_t *ifcfg);
+int     nl_bsal_iface_remove(const bsal_ifconfig_t *ifcfg);
 
-ioctl_status_t ioctl80211_device_temp_results_get(
-        radio_entry_t              *radio_cfg,
-        dpp_device_temp_t          *temp);
+int     nl_bsal_client_add(const char *ifname, const uint8_t *mac_addr, const bsal_client_config_t *conf);
+int     nl_bsal_client_update(const char *ifname, const uint8_t *mac_addr, const bsal_client_config_t *conf);
+int     nl_bsal_client_remove(const char *ifname, const uint8_t *mac_addr);
 
-ioctl_status_t ioctl80211_device_txchainmask_results_get(
-        radio_entry_t              *radio_cfg,
-        dpp_device_txchainmask_t   *txchainmask);
+int     nl_bsal_client_measure(const char *ifname, const uint8_t *mac_addr, int num_samples);
+int     nl_bsal_client_disconnect(const char *ifname, const uint8_t *mac_addr, bsal_disc_type_t type, uint8_t reason);
+int     nl_bsal_client_info(const char *ifname, const uint8_t *mac_addr, bsal_client_info_t *info);
 
-#endif /* IOCTL80211_DEVICE_H_INCLUDED */
+int     nl_bsal_bss_tm_request(const char *ifname, const uint8_t *mac_addr, const bsal_btm_params_t *btm_params);
+int     nl_bsal_rrm_beacon_report_request(const char *ifname, const uint8_t *mac_addr, const bsal_rrm_params_t *rrm_params);
+
+int     nl_bsal_rrm_set_neighbor(const char *ifname, const bsal_neigh_info_t *nr);
+int     nl_bsal_rrm_remove_neighbor(const char *ifname, const bsal_neigh_info_t *nr);
+int     nl_bsal_send_action(const char *ifname, const uint8_t *mac_addr, const uint8_t *data, unsigned int data_len);
+
+#endif /* BSAL_H_INCLUDED */

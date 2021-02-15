@@ -25,7 +25,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #define _GNU_SOURCE
-#include "target_nl80211.h"
+#include "nl80211.h"
 
 #include <string.h>
 
@@ -42,6 +42,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <netlink/genl/genl.h>
 
 #include <net/if.h>
+
+#define MBM_TO_DBM(gain) ((gain) / 100)
+#define DBM_TO_MBM(gain) ((gain) * 100)
 
 static ev_io            nl_ev_loop;
 struct nl_global_info   nl_global;
@@ -114,6 +117,248 @@ int nl_req_get_iface_phy_idx(int if_index)
     return phy_idx;
 }
 
+static int nl_resp_parse_txpwr(struct nl_msg *msg, void *txpwr)
+{
+    int *txp = (int *)txpwr;
+    struct genlmsghdr   *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct nlattr       *tb[NL80211_ATTR_MAX + 1];
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (!tb[NL80211_ATTR_WIPHY_TX_POWER_LEVEL])
+        return -EINVAL;
+
+    *txp = MBM_TO_DBM(nla_get_u32(tb[NL80211_ATTR_WIPHY_TX_POWER_LEVEL]));
+    LOGT("%s: txpower %d", __func__, *txp);
+
+    return NL_OK;
+}
+
+int nl80211_get_txpwr(const char *ifname)
+{
+    int if_idx = -EINVAL;
+    int txpwr = 0;
+    struct nl_msg *msg;
+
+    if ((if_idx = util_sys_ifname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    if (!msg)
+        return -EINVAL;
+
+    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_idx);
+    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_txpwr, &txpwr);
+
+    return txpwr;
+}
+
+int nl80211_set_txpwr(const char *ifname, const int dbm)
+{
+    int if_idx = -EINVAL;
+    int phy_idx = -EINVAL;
+    struct nl_msg *msg;
+    enum nl80211_tx_power_setting type;
+
+    if ((if_idx = util_sys_ifname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    if ((phy_idx = nl_req_get_iface_phy_idx(if_idx)) < 0)
+        return -EINVAL;
+
+    type = NL80211_TX_POWER_LIMITED;
+
+    msg = nlmsg_init(&nl_global, NL80211_CMD_SET_WIPHY, false);
+    if (!msg)
+        return -EINVAL;
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_TX_POWER_SETTING, type);
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_TX_POWER_LEVEL, DBM_TO_MBM(dbm));
+    nlmsg_send_and_recv(&nl_global, msg, NULL, NULL);
+
+    return 0;
+}
+
+char *dfs_state_string(enum nl80211_dfs_state state)
+{
+    switch (state) {
+    case NL80211_DFS_USABLE:
+        return "DFS_NOP_FINISHED";
+    case NL80211_DFS_AVAILABLE:
+        return "DFS_CAC_COMPLETED";
+    case NL80211_DFS_UNAVAILABLE:
+        return "DFS_NOP_STARTED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+int nl_resp_parse_channels(struct nl_msg *msg, void *arg)
+{
+    int     rband;
+    int     rfreq;
+    int     state;
+    int     channel = 0;
+    char    temp_buf[BFR_SIZE_64] = "";
+    struct nlattr *nl_band;
+    struct nlattr *nl_freq;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct nlattr *tb_band[NL80211_BAND_ATTR_MAX + 1];
+    struct nlattr *tb_freq[NL80211_FREQUENCY_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct data_buffer_4k *buf = (struct data_buffer_4k *) arg;
+    static struct nla_policy f_policy[NL80211_FREQUENCY_ATTR_MAX + 1] = {
+        [NL80211_FREQUENCY_ATTR_FREQ]       = { .type = NLA_U32 },
+        [NL80211_FREQUENCY_ATTR_DISABLED]   = { .type = NLA_FLAG },
+        [NL80211_FREQUENCY_ATTR_RADAR]      = { .type = NLA_FLAG },
+        [NL80211_FREQUENCY_ATTR_DFS_STATE]  = { .type = NLA_U32 },
+    };
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (!tb[NL80211_ATTR_WIPHY_BANDS])
+        return NL_SKIP;
+
+    nla_for_each_nested(nl_band, tb[NL80211_ATTR_WIPHY_BANDS], rband) {
+        nla_parse(tb_band, NL80211_BAND_ATTR_MAX, nla_data(nl_band), nla_len(nl_band), NULL);
+
+        if (!tb_band[NL80211_BAND_ATTR_FREQS])
+            return NL_SKIP;
+
+        nla_for_each_nested(nl_freq, tb_band[NL80211_BAND_ATTR_FREQS], rfreq) {
+            nla_parse(tb_freq, NL80211_FREQUENCY_ATTR_MAX, nla_data(nl_freq), nla_len(nl_freq), f_policy);
+
+            if (!tb_freq[NL80211_FREQUENCY_ATTR_FREQ])
+                continue;
+
+            channel = util_freq_to_chan(nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_FREQ]));
+            if (!channel || tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
+                continue;
+
+            if (tb_freq[NL80211_FREQUENCY_ATTR_DFS_STATE])
+                state = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_DFS_STATE]);
+            else
+                state = -EINVAL;
+
+            if (tb_freq[NL80211_FREQUENCY_ATTR_RADAR])
+                snprintf(temp_buf, sizeof(temp_buf), "chan %d DFS %s\n", channel, dfs_state_string(state));
+            else
+                snprintf(temp_buf, sizeof(temp_buf), "chan %d\n", channel);
+
+            if ((strlen(buf->buf) + strlen(temp_buf)) < buf->len)
+                strcat(buf->buf, temp_buf);
+            else
+                return NL_SKIP;
+        }
+    }
+
+    return NL_SKIP;
+}
+
+int nl_req_get_channels(const char *ifname, char *buf, int len)
+{
+    struct nl_msg *msg;
+    int phy_idx = -EINVAL;
+    int if_idx = -EINVAL;
+    struct data_buffer_4k chan_buf = { "", BFR_SIZE_4K};
+
+    if ((if_idx = util_sys_ifname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    if ((phy_idx = nl_req_get_iface_phy_idx(if_idx)) < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_WIPHY, true);
+    if (!msg) return -ENOMEM;
+
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+
+    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_channels, &chan_buf);
+
+    strlcpy(buf, chan_buf.buf, len);
+
+    return 0;
+}
+
+int nl_resp_parse_init_channels(struct nl_msg *msg, void *arg)
+{
+    int     rband;
+    int     rfreq;
+    int     channel = 0;
+    struct nlattr *nl_band;
+    struct nlattr *nl_freq;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct nlattr *tb_band[NL80211_BAND_ATTR_MAX + 1];
+    struct nlattr *tb_freq[NL80211_FREQUENCY_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct channel_status *chan_stat = (struct channel_status *)arg;
+    enum nl80211_dfs_state dfs_state = -EINVAL;
+    static struct nla_policy f_policy[NL80211_FREQUENCY_ATTR_MAX + 1] = {
+        [NL80211_FREQUENCY_ATTR_FREQ]       = { .type = NLA_U32 },
+        [NL80211_FREQUENCY_ATTR_DISABLED]   = { .type = NLA_FLAG },
+        [NL80211_FREQUENCY_ATTR_RADAR]      = { .type = NLA_FLAG },
+        [NL80211_FREQUENCY_ATTR_DFS_STATE]  = { .type = NLA_U32 },
+    };
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (!tb[NL80211_ATTR_WIPHY_BANDS])
+        return NL_SKIP;
+
+    nla_for_each_nested(nl_band, tb[NL80211_ATTR_WIPHY_BANDS], rband) {
+        nla_parse(tb_band, NL80211_BAND_ATTR_MAX, nla_data(nl_band), nla_len(nl_band), NULL);
+
+        if (!tb_band[NL80211_BAND_ATTR_FREQS])
+            return NL_SKIP;
+
+        nla_for_each_nested(nl_freq, tb_band[NL80211_BAND_ATTR_FREQS], rfreq) {
+            nla_parse(tb_freq, NL80211_FREQUENCY_ATTR_MAX, nla_data(nl_freq), nla_len(nl_freq), f_policy);
+
+            if (!tb_freq[NL80211_FREQUENCY_ATTR_FREQ])
+                continue;
+
+            channel = util_freq_to_chan(nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_FREQ]));
+            if (!channel || tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
+                continue;
+
+            if (tb_freq[NL80211_FREQUENCY_ATTR_RADAR])
+                chan_stat[channel].state = NOP_FINISHED;
+            else
+                chan_stat[channel].state = ALLOWED;
+
+            if (tb_freq[NL80211_FREQUENCY_ATTR_DFS_STATE])
+                dfs_state = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_DFS_STATE]);
+
+            if (dfs_state == NL80211_DFS_AVAILABLE)
+                chan_stat[channel].state = CAC_COMPLETED;
+            else if (dfs_state == NL80211_DFS_UNAVAILABLE)
+                chan_stat[channel].state = NOP_STARTED;
+        }
+    }
+
+    return NL_SKIP;
+}
+
+int nl_req_init_channels(struct channel_status *chan_status)
+{
+    struct nl_msg *msg;
+
+    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_WIPHY, true);
+    if (!msg) return -ENOMEM;
+
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+
+    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_init_channels, chan_status);
+
+    return 0;
+}
+
 int nl_req_del_iface(const char *ifname)
 {
     struct nl_msg *msg;
@@ -182,8 +427,6 @@ int nl_resp_parse_iface_curr_chan(struct nl_msg *msg, void *arg)
 
 int nl_req_get_iface_curr_chan(const char *ifname)
 {
-    DBG();
-
     int curr_chan = 0;
     int if_index;
     struct nl_msg *msg;
@@ -248,8 +491,6 @@ int nl_resp_parse_iface_supp_chan(struct nl_msg *msg, void *arg)
 
 int nl_req_get_iface_supp_chan(const char *ifname)
 {
-    DBG();
-
     struct nl_msg *msg;
     int channel = -EINVAL;
     int phy_idx = -EINVAL;
@@ -279,8 +520,6 @@ int nl_req_get_iface_supp_chan(const char *ifname)
  */
 int nl_req_set_reg_dom(char *country_code)
 {
-    DBG();
-
     struct nl_msg *msg;
 
     msg = nlmsg_init(&nl_global, NL80211_CMD_REQ_SET_REG, false);
@@ -298,8 +537,6 @@ int nl_req_set_reg_dom(char *country_code)
 
 int nl_resp_parse_reg_dom(struct nl_msg *msg, void *arg)
 {
-    DBG();
-
     char *country_code = arg;
     struct nlattr *tb[NL80211_ATTR_MAX + 1];
     struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -322,8 +559,6 @@ int nl_resp_parse_reg_dom(struct nl_msg *msg, void *arg)
 
 int nl_req_get_reg_dom(char *buf)
 {
-    DBG();
-
     struct nl_msg *msg;
 
     msg = nlmsg_init(&nl_global, NL80211_CMD_GET_REG, true);
@@ -332,14 +567,42 @@ int nl_req_get_reg_dom(char *buf)
     return nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_reg_dom, buf);
 }
 
-static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname, int ifidx)
+int nl_resp_parse_mode(struct nl_msg *msg, void *arg)
 {
-    LOGT("ifindex[%d] ifname[%s]", ifidx, ifname);
+    int *type = (int *)arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (!tb[NL80211_ATTR_IFTYPE]) {
+        LOGT("Mode unspecified\n");
+        return NL_SKIP;
+    }
+    *type = nla_get_u32(tb[NL80211_ATTR_IFTYPE]);
+    return NL_SKIP;
 }
 
-static void nl80211_add_phy(struct nlattr **tb, char *name)
+bool nl_req_get_mode(const char *ifname, char *mode, int len)
 {
-     LOGT("phyname[%s]", name);
+    int if_index = -EINVAL;
+    int mode_type = -EINVAL;
+    struct nl_msg *msg;
+    enum nl80211_iftype type = NL80211_IFTYPE_UNSPECIFIED;
+
+    if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
+        return false;
+
+    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    if (!msg)
+        return false;
+
+    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
+    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_mode, &mode_type);
+    type = mode_type;
+
+    return util_mode(type, mode, len);
 }
 
 static int nl_event_parse(struct nl_msg *msg, void *arg)
@@ -348,10 +611,10 @@ static int nl_event_parse(struct nl_msg *msg, void *arg)
     struct nlattr *tb[NL80211_ATTR_MAX + 1];
     char ifname[IFNAMSIZ] = {'\0'};
     char phyname[IFNAMSIZ] = {'\0'};
-    int ifidx = -1, phy = -1;
+    int ifidx = -1;
+    int phy = -1;
 
     memset(tb, 0, sizeof(tb));
-
     nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
 
     if (tb[NL80211_ATTR_IFINDEX]) {
@@ -370,30 +633,17 @@ static int nl_event_parse(struct nl_msg *msg, void *arg)
     }
 
     switch (gnlh->cmd) {
-    case NL80211_CMD_NEW_INTERFACE:
-        nl80211_add_iface(tb, ifname, phyname, ifidx);
-        break;
-    case NL80211_CMD_NEW_WIPHY:
-    case NL80211_CMD_GET_WIPHY:
-        nl80211_add_phy(tb, phyname);
-        break;
-#if 0
-    case NL80211_CMD_NEW_STATION:
-        nl80211_add_station(tb, ifname);
-        break;
-    case NL80211_CMD_DEL_STATION:
-        nl80211_del_station(tb, ifname);
-        break;
-    case NL80211_CMD_DEL_INTERFACE:
-        nl80211_del_iface(tb, ifname);
-        break;
-    case NL80211_CMD_DEL_WIPHY:
-        nl80211_del_phy(tb, phyname);
-        break;
-#endif
-    default:
-        LOGT("gnlh->cmd [%d]", gnlh->cmd);
-        break;
+        case NL80211_CMD_NEW_INTERFACE:
+        case NL80211_CMD_NEW_WIPHY:
+        case NL80211_CMD_GET_WIPHY:
+        case NL80211_CMD_NEW_STATION:
+        case NL80211_CMD_DEL_STATION:
+        case NL80211_CMD_DEL_INTERFACE:
+        case NL80211_CMD_DEL_WIPHY:
+        default:
+            LOGT("%s: ifname=%s phyname=%s command=%d",
+                __func__, ifname, phyname, gnlh->cmd);
+            break;
     }
 
     return NL_OK;
@@ -430,8 +680,6 @@ static void nl_ev_handler(struct ev_loop *ev, struct ev_io *io, int event)
 
 int netlink_global_init(struct ev_loop *loop)
 {
-    DBG();
-
     if (netlink_init(&nl_global) < 0) {
         LOGT("nl80211: failed to connect\n");
         return -1;
@@ -460,13 +708,7 @@ void netlink_global_deinit(void)
 
 void target_nl80211_init(struct ev_loop *loop)
 {
-    DBG();
-
     netlink_global_init(loop);
-
-    //TODO [Remove]
-    //nl_req_set_reg_dom("FR");
-    //nl_req_get_iface_chan("home_ap_24");
 
     return;
 }

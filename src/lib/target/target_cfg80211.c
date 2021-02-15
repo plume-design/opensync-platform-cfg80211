@@ -24,30 +24,6 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-/*
- * Known bugs and issues:
- *  - there's still a lot of fork+exec which is
- *    wasting cpu resources. what can be improved
- *    with a relatively small effort is:
- *      a. implement iwpriv handling internally
- *      b. implement wpa ctrl socket commands
- *         internally
- *
- *  - BM accesses driver ACLs directly and effectively
- *    races with WM's VIF_Config vs VIF_State re-syncs. BM
- *    must start using VIF_Config mac_list entries (i.e. go
- *    through WM). Arguably BM should become part of WM
- *    because it's way too coupled tightly with the driver
- *    to let it work in parallel.
- *
- * TODOs:
- *  - use STRLCPY instead of snprintf() etc where possible
- *  - automate errno+strerror() error printing, and handling of if (err) LOGW+return
- *  - clean up process execution: readcmd, forkexec, util_exec_read, E
- *  - use F() for temporary one-shot snprintf() stuff
- *  - constify target ifname map/unmap
- *  - rename {cloud,device}_{vif,phy}_ifname to {c,d}_{vif,phy} for consistency and conciseness
- */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdbool.h>
@@ -86,44 +62,40 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "ovsdb_table.h"
 #include "ovsdb_cache.h"
 
-#include "qca_bsal.h"
+#include "bsal.h"
 
 #include <linux/un.h>
 #include <opensync-ctrl.h>
 #include <opensync-wpas.h>
 #include <opensync-hapd.h>
 
-#include "target_nl80211.h"
+#include "target_cfg80211.h"
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
 
 /******************************************************************************
  * Driver-dependant feature compatibility
  *****************************************************************************/
-enum {
-    IEEE80211_EV_DUMMY_CSA_RX = 0xffff,
-    IEEE80211_EV_DUMMY_CHANNEL_LIST_UPDATED = 0xfffe,
-    IEEE80211_EV_DUMMY_RADAR_DETECT = 0xfffd,
-};
-
-#ifndef IEEE80211_EV_CSA_RX_SUPPORTED
-#warning csa rx patch is missing
-#define IEEE80211_EV_CSA_RX IEEE80211_EV_DUMMY_CSA_RX
-#endif
-
-#ifndef IEEE80211_EV_CHANNEL_LIST_UPDATED_SUPPORTED
-#warning dfs chanlist update patch is missing
-#define IEEE80211_EV_CHANNEL_LIST_UPDATED IEEE80211_EV_DUMMY_CHANNEL_LIST_UPDATED
-#endif
-
-#ifndef IEEE80211_EV_RADAR_DETECT_SUPPORTED
-#warning dfs radar detect patch is missing
-#define IEEE80211_EV_RADAR_DETECT IEEE80211_EV_DUMMY_RADAR_DETECT
-#endif
 
 /******************************************************************************
  * GLOBALS
  *****************************************************************************/
+
+#define CHAN_SWITCH_DEFAULT_CS_COUNT 15
+
+#define HOME_AP_PREFIX  "home-ap"
+#define HOME_AP_24      "home-ap-24"
+#define BHAUL_AP_24     "bhaul-ap-24"
+
+#define UTIL_CB_PHY         "phy"
+#define UTIL_CB_VIF         "vif"
+#define UTIL_CB_KV_KEY      "delayed_update_ifname_list"
+#define UTIL_CB_DELAY_SEC   1
+
+static ev_timer g_util_cb_timer;
+
+static int      util_nl_fd = -1;
+static ev_io    util_nl_io;
 
 struct util_wpa_ctrl_watcher {
     ev_io io;
@@ -145,7 +117,23 @@ struct fallback_parent {
     char bssid[18];
 };
 
+struct util_thermal {
+    ev_timer timer;
+    struct ds_dlist_node list;
+    const char **type;
+    char phy[32];
+    int period_sec;
+    int tx_chainmask_capab;
+    int tx_chainmask_limit;
+    int should_downgrade;
+    int temp_upgrade;
+    int temp_downgrade;
+};
+
+static ds_dlist_t g_thermal_list = DS_DLIST_INIT(struct util_thermal, list);
+
 static ds_dlist_t g_kvstore_list = DS_DLIST_INIT(struct kvstore, list);
+
 static struct target_radio_ops rops;
 
 /* See target_radio_config_init2() for details */
@@ -154,33 +142,13 @@ static struct schema_Wifi_VIF_Config *g_vconfs;
 static int g_num_rconfs;
 static int g_num_vconfs;
 
-static bool
-util_radio_country_get(const char *phy, char *country, int country_len);
+struct channel_status g_chan_status[IEEE80211_CHAN_MAX];
+
+static bool util_radio_country_get(const char *phy, char *country, int country_len);
 
 /******************************************************************************
  * Generic helpers
  *****************************************************************************/
-
-#define D(name, fallback) ((name ## _exists) ? (name) : (fallback))
-#define A(size) alloca(size), size
-#define F(fmt, ...) ({ char *__p = alloca(4096); memset(__p, 0, 4096); snprintf(__p, 4095, fmt, ##__VA_ARGS__); __p; })
-#define E(prog, ...) forkexec(prog, (const char *[]){ prog, __VA_ARGS__, NULL }, NULL, NULL, 0)
-#define R(...) file_geta(__VA_ARGS__)
-#define timeout_arg "timeout", "-s", "KILL", "-t", "3"
-#define runcmd(...) readcmd(0, 0, 0, ## __VA_ARGS__)
-#define WARN(cond, ...) (cond && (LOGW(__VA_ARGS__), 1))
-#define util_exec_read(xfrm, buf, len, prog, ...) forkexec(prog, (const char *[]){ prog, __VA_ARGS__,  NULL }, xfrm, buf, len)
-#define util_exec_simple(prog, ...) forkexec(prog, (const char *[]){ prog, __VA_ARGS__, NULL }, NULL, NULL, 0)
-#define util_exec_expect(str, ...) ({ \
-            char buf[32]; \
-            int err = util_exec_read(rtrimnl, buf, sizeof(buf), __VA_ARGS__); \
-            err || strcmp(str, buf); \
-        })
-#define EXEC(...) strexa(__VA_ARGS__)
-#define CMD_TIMEOUT(...) "timeout", "-s", "KILL", "3", ## __VA_ARGS__
-#define HOSTAPD_CLI(sockdir, vif, ...) EXEC(CMD_TIMEOUT("hostapd_cli", "-p", sockdir, "-i", vif, ## __VA_ARGS__))
-
-#include "target_osync_11ax.h"
 
 void
 rtrimnl(char *str)
@@ -402,12 +370,6 @@ util_exec_scripts(const char *vif)
                  target_bin_dir(),
                  target_bin_dir(),
                  vif);
-#if 0
-    err = runcmd("{ cd %s/wm.d 2>/dev/null || cd %s/../scripts/wm.d 2>/dev/null; } && for i in *.sh; do sh $i %s; done; exit 0",
-                 target_bin_dir(),
-                 target_bin_dir(),
-                 vif);
-#endif
 
     err = system(cmd);
     if (err) {
@@ -438,6 +400,125 @@ util_ovsdb_wpa_clear(const char* if_name)
         LOGD("wps: Unset Wifi_VIF_Config:wps_pbc on iface: %s after starting WPS session", if_name);
     else
         LOGW("wps: Failed to unset Wifi_VIF_Config:wps_pbc on iface: %s", if_name);
+}
+
+int ht_mode_to_bw(const struct schema_Wifi_Radio_Config *rconf, int *width)
+{
+    char *width_ptr;
+
+    if (!rconf->ht_mode_exists) return -EINVAL;
+
+    width_ptr = strlen(rconf->ht_mode) > 2 ? (rconf->ht_mode + 2) : "20";
+    *width = atoi(width_ptr);
+
+    return 0;
+}
+
+void ht_mode_to_mode(const struct schema_Wifi_Radio_Config *rconf, char *mode, int mode_len)
+{
+    if (!rconf->hw_mode_exists) return;
+
+    if (!strcmp(rconf->hw_mode, "11ac"))
+        strscpy(mode, "vht", mode_len);
+    if (!strcmp(rconf->hw_mode, "11n"))
+        strscpy(mode, "ht", mode_len);
+
+    return;
+}
+
+int get_sec_chan_offset(const struct schema_Wifi_Radio_Config *rconf)
+{
+    if (!strcmp(rconf->ht_mode, "HT40")
+        || !strcmp(rconf->ht_mode, "HT80")
+        || !strcmp(rconf->ht_mode, "HT160")) {
+        switch (rconf->channel) {
+            case 1 ... 7:
+            case 36:
+            case 44:
+            case 52:
+            case 60:
+            case 100:
+            case 108:
+            case 116:
+            case 124:
+            case 132:
+            case 140:
+            case 149:
+            case 157:
+                return 1;
+            case 8 ... 13:
+            case 40:
+            case 48:
+            case 56:
+            case 64:
+            case 104:
+            case 112:
+            case 120:
+            case 128:
+            case 136:
+            case 144:
+            case 153:
+            case 161:
+                return -1;
+            default:
+                return -EINVAL;
+        }
+    }
+
+    return -EINVAL;
+}
+
+char *chan_state_to_str(enum channel_state state)
+{
+    switch(state) {
+        case ALLOWED:
+            return "ALLOWED";
+        case CAC_STARTED:
+            return "CAC_STARTED";
+        case CAC_COMPLETED:
+            return "CAC_COMPLETED";
+        case NOP_STARTED:
+            return "NOP_STARTED";
+        case NOP_FINISHED:
+            return "NOP_FINISHED";
+        default:
+            return "INVALID";
+    }
+}
+
+int get_chanlist_cfreq(const int *chanlist)
+{
+    int sum = 0;
+    int cnt = 0;
+
+    if (!chanlist)
+        return 0;
+
+    while (*chanlist) {
+        sum += *chanlist;
+        cnt++;
+        chanlist++;
+    }
+    return sum / cnt;
+}
+
+const int *dfs_get_chanlist_from_centerchan(const int channel, const int centerchan)
+{
+    const int *chanlist;
+
+    chanlist = unii_5g_chan2list(channel, 20);
+    if (centerchan == get_chanlist_cfreq(chanlist))
+        return chanlist;
+
+    chanlist = unii_5g_chan2list(channel, 40);
+    if (centerchan == get_chanlist_cfreq(chanlist))
+        return chanlist;
+
+    chanlist = unii_5g_chan2list(channel, 80);
+    if (centerchan == get_chanlist_cfreq(chanlist))
+        return chanlist;
+
+    return NULL;
 }
 
 /******************************************************************************
@@ -658,6 +739,7 @@ util_wifi_get_phy_any_ap_vif(const char *phy,
             util_file_read_str(sys_path, sys_parent, sizeof(sys_parent)) > 0 &&
             (rtrimws(sys_parent), 1) &&
             !strstr(p->d_name, "sta") &&
+            !strstr(p->d_name, "wlan") &&
             !strcmp(phy_parent, sys_parent)) {
             strscpy(buf, p->d_name, len);
             break;
@@ -726,31 +808,6 @@ int util_get_vif_radio(const char *in_vif, char *phy_buf, int len)
     }
 
     return -1;
-}
-
-static int
-util_wifi_get_parent(const char *vif,
-                     char *buf,
-                     int len)
-{
-    char p_buf[32] = {0};
-
-    if (util_get_vif_radio(vif, p_buf, sizeof(p_buf))) {
-        LOGW("%s: failed to get vif radio", vif);
-        return -EINVAL;
-    }
-    strscpy(buf, p_buf, len);
-
-    return 0;
-}
-
-static bool
-util_wifi_is_phy_vif_match(const char *phy,
-                           const char *vif)
-{
-    char buf[32];
-    util_wifi_get_parent(vif, buf, sizeof(buf));
-    return !strcmp(phy, buf);
 }
 
 static void
@@ -875,23 +932,6 @@ util_wifi_any_phy_vif(const char *phy,
     return strlen(p) > 0 ? 0 : -1;
 }
 
-static bool
-util_wifi_phy_is_offload(const char *phy)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/is_offload", phy);
-    return 0 == access(path, R_OK);
-}
-
-static bool
-util_wifi_phy_is_2ghz(const char *phy)
-{
-    const char *p = F("/sys/class/net/%s/2g_maxchwidth", phy);
-    char buf[32] = {};
-    util_file_read_str(p, buf, sizeof(buf));
-    return strlen(buf) > 0;
-}
-
 static int
 util_vif_ap_vlan_addr(const char *vif, char *addr, size_t addrlen)
 {
@@ -923,46 +963,20 @@ util_vif_ap_vlan_addr(const char *vif, char *addr, size_t addrlen)
     return -ENOENT;
 }
 
-/******************************************************************************
- * iwconfig helpers
- *****************************************************************************/
-
-static int
-util_iwconfig_freq_to_chan(int mhz)
-{
-    if (mhz < 2412)
-        return 0;
-    if (mhz < 5000)
-        return 1 + ((mhz - 2412) / 5);
-    else if (mhz < 6000)
-        return (mhz - 5000) / 5;
-    else
-        return 0;
-}
-
-#define BHAUL_AP_PREFIX "bhaul-ap"
-#define HOME_AP_PREFIX "home_ap"
-
 static bool
 util_get_phy_chan(const char *phy,
                   int *chan)
 {
-    char vifs[512];
-    char *vifr = vifs;
-    char *vif;
+    char ap_vif[BFR_SIZE_64] = "";
 
-    if (util_wifi_get_phy_all_vifs(phy, vifs, sizeof(vifs))) {
-        LOGE("%s: get vifs failed", phy);
+    if (util_wifi_get_phy_any_ap_vif(phy, ap_vif, sizeof(ap_vif))) {
+        LOGE("%s: get ap vif failed", phy);
         return false;
     }
 
-    while ((vif = strsep(&vifr, " ")))
-        if (strlen(vif))
-            if (strstr(vif, BHAUL_AP_PREFIX) || strstr(vif, HOME_AP_PREFIX)) {
-                *chan = nl_req_get_iface_curr_chan(vif);
-                if (*chan > 0)
-                    return true;
-            }
+    *chan = nl_req_get_iface_curr_chan(ap_vif);
+    if (*chan > 0)
+        return true;
 
     return false;
 }
@@ -994,110 +1008,55 @@ util_get_vif_chan(const char *vif,
 }
 
 static int
-util_iwconfig_get_opmode(const char *vif, char *opmode, int len)
+util_get_opmode(const char *vif, char *opmode, int len)
 {
-    char buf[256];
-    char *p;
-    int err;
-
-    memset(opmode, 0, len);
-
-    err = util_exec_read(rtrimws, buf, sizeof(buf),
-                         "iwinfo", vif, "info");
-    if (err) {
-        LOGW("%s: failed to get opmode: %d", vif, err);
-        return 0;
-    }
-
-    if (!strtok(buf, "\n") || !(p = strtok(NULL, "\n")))
-        return 0;
-
-    if (!(p = strtok(NULL, "\n")))
-        return 0;
-
-    if (strstr(p, "Mode: Master")) {
-        strscpy(opmode, "ap", len);
+    if (nl_req_get_mode(vif, opmode, len) == true)
         return 1;
-    }
 
-    if (strstr(p, "Mode: Client")) {
-        strscpy(opmode, "sta", len);
-        return 1;
-    }
-
+    LOGW("%s: failed to get opmode", vif);
     return 0;
 }
 
 static char *
-util_iwconfig_any_phy_vif_type(const char *phy, const char *type, char *buf, int len)
+util_any_phy_vif_type(const char *phy, const char *type, char *buf, int len)
 {
     char opmode[32];
     char *vif;
-    if (util_wifi_get_phy_vifs(phy, buf, len))
+
+    if (util_wifi_get_phy_all_vifs(phy, buf, len))
         return NULL;
+
     while ((vif = strsep(&buf, " ")))
         if (!type)
             return vif;
-        else if (util_iwconfig_get_opmode(vif, opmode, sizeof(opmode)))
+        else if (util_get_opmode(vif, opmode, sizeof(opmode)))
             if (!strcmp(opmode, type))
                 return vif;
+
     return NULL;
 }
 
 static void
-util_iwconfig_set_tx_power(const char *phy, const int tx_power_dbm)
+util_set_tx_power(const char *phy, const int tx_power_dbm)
 {
-    const char *txpwr = strfmta("%d", tx_power_dbm);
-    const char *vif;
-    char *vifs;
-
-    if (WARN_ON(util_wifi_get_phy_vifs(phy, vifs = A(512)) != 0))
-        return;
-    while ((vif = strsep(&vifs, " ")) != NULL)
-        if (strlen(vif) > 0)
-            WARN_ON(!strexa("iwconfig", vif, "txpower", txpwr));
+    nl80211_set_txpwr(phy, tx_power_dbm);
+    return;
 }
 
 static int
-util_iwconfig_get_tx_power(const char *phy)
+util_get_tx_power(const char *phy)
 {
-    const char *vif;
-    const char *buf;
-    char *vifs;
+    char ap_vif[BFR_SIZE_64] = "";
     int txpwr = 0;
 
-    if (WARN_ON(util_wifi_get_phy_vifs(phy, vifs = A(512)) != 0))
+    if (util_wifi_get_phy_any_ap_vif(phy, ap_vif, sizeof(ap_vif))) {
+        LOGE("%s: get ap vif failed", phy);
         return 0;
-
-    while ((vif = strsep(&vifs, " ")) != NULL) {
-        if (strlen(vif) == 0)
-            continue;
-
-        buf = strexa("iwconfig", vif);
-        if (WARN_ON(!buf))
-            continue;
-
-        if (strstr(buf, "Not-Associated"))
-            continue;
-
-        buf = strstr(buf, "Tx-Power");
-        if (WARN_ON(!buf))
-            continue;
-
-        buf = strpbrk(buf, ":=");
-        if (WARN_ON(!buf))
-            continue;
-
-        buf += 1; /* skip the : or = */
-
-        if (txpwr > 0 && txpwr != atoi(buf))
-            return 0;
-
-        if (atoi(buf) == 50) /* not yet valid */
-            continue;
-
-        txpwr = atoi(buf);
     }
+
+    txpwr = nl80211_get_txpwr(ap_vif);
+    if (txpwr < 0)
+        return 0;
 
     return txpwr;
 }
@@ -1139,16 +1098,11 @@ util_cb_vif_state_channel_sanity_update(const struct schema_Wifi_Radio_State *rs
 {
     const struct kvstore *kv;
     char *vif;
-    char *p;
+    char vif_list[512];
+    char *p = vif_list;
 
-    /* qcawifi sta vap may not report ev_chan_change over netlink meaning its
-     * vstate won't get updated under normal circumstances
-     *
-     * patching driver won't solve another corner case where netlink buffer is
-     * overrun and events are dropped - hence the sanity check below
-     */
     if (rstate->channel_exists)
-        if (!util_wifi_get_phy_vifs(rstate->if_name, p = A(256)))
+        if (!util_wifi_get_phy_all_vifs(rstate->if_name, p, sizeof(vif_list)))
             while ((vif = strsep(&p, " ")))
                 if ((kv = util_kv_get(F("%s.last_channel", vif))))
                     if (atoi(kv->val) != rstate->channel) {
@@ -1185,13 +1139,6 @@ util_cb_phy_state_update(const char *phy)
 /******************************************************************************
  * Target delayed callback helpers
  *****************************************************************************/
-
-static ev_timer g_util_cb_timer;
-
-#define UTIL_CB_PHY "phy"
-#define UTIL_CB_VIF "vif"
-#define UTIL_CB_KV_KEY "delayed_update_ifname_list"
-#define UTIL_CB_DELAY_SEC 1
 
 static void
 util_cb_delayed_update_timer(struct ev_loop *loop,
@@ -1263,7 +1210,7 @@ util_cb_delayed_update(const char *type, const char *ifname)
 
 /* FIXME: forward declarations are bad */
 static void
-qca_hapd_sta_regen(struct hapd *hapd);
+hapd_sta_regen(struct hapd *hapd);
 
 static void
 util_cb_delayed_update_all(void)
@@ -1281,7 +1228,7 @@ util_cb_delayed_update_all(void)
         } else if (0 == util_wifi_get_parent(i->d_name, phy, sizeof(phy))) {
             hapd = hapd_lookup(i->d_name);
             if (hapd)
-                qca_hapd_sta_regen(hapd);
+                hapd_sta_regen(hapd);
             util_cb_delayed_update(UTIL_CB_VIF, i->d_name);
         }
     }
@@ -1295,7 +1242,7 @@ util_cb_delayed_update_all(void)
 /* target -> core */
 
 static void
-qca_hapd_sta_report(struct hapd *hapd, const char *mac)
+hapd_sta_report(struct hapd *hapd, const char *mac)
 {
     struct schema_Wifi_Associated_Clients client;
     int exists;
@@ -1311,35 +1258,24 @@ qca_hapd_sta_report(struct hapd *hapd, const char *mac)
 }
 
 static void
-qca_hapd_sta_regen_iter(struct hapd *hapd, const char *mac, void *data)
+hapd_sta_regen_iter(struct hapd *hapd, const char *mac, void *data)
 {
-    qca_hapd_sta_report(hapd, mac);
+    hapd_sta_report(hapd, mac);
 }
 
 static void
-qca_hapd_sta_regen(struct hapd *hapd)
+hapd_sta_regen(struct hapd *hapd)
 {
     LOGI("%s: regenerating sta list", hapd->ctrl.bss);
 
     if (rops.op_flush_clients)
         rops.op_flush_clients(hapd->ctrl.bss);
 
-    hapd_sta_iter(hapd, qca_hapd_sta_regen_iter, NULL);
+    hapd_sta_iter(hapd, hapd_sta_regen_iter, NULL);
 }
 
-#if 0
-/*
- * The issue specific to "*scanfilter*" command is fixed in
- * the driver so this code is not required.
- */
-/* FIXME: forward declarations are bad */
 static void
-util_qca_set_scanfilter(const char *vif,
-                           const char *ssid);
-#endif
-
-static void
-qca_wpas_report(struct wpas *wpas)
+wpas_report(struct wpas *wpas)
 {
     struct schema_Wifi_VIF_State vstate;
 
@@ -1356,104 +1292,282 @@ qca_wpas_report(struct wpas *wpas)
      * The issue specific to "*scanfilter*" command is fixed in
      * the driver so this code is not required.
      */
-    util_qca_set_scanfilter(wpas->ctrl.bss, vstate.ssid);
+    util_set_scanfilter(wpas->ctrl.bss, vstate.ssid);
 #endif
 }
 
 /* ctrl -> target */
 
 static void
-qca_hapd_sta_connected(struct hapd *hapd, const char *mac, const char *keyid)
+hapd_sta_connected(struct hapd *hapd, const char *mac, const char *keyid)
 {
-    qca_hapd_sta_report(hapd, mac);
+    hapd_sta_report(hapd, mac);
 }
 
 static void
-qca_hapd_sta_disconnected(struct hapd *hapd, const char *mac)
+hapd_sta_disconnected(struct hapd *hapd, const char *mac)
 {
-    qca_hapd_sta_report(hapd, mac);
+    hapd_sta_report(hapd, mac);
 }
 
 static void
-qca_hapd_ap_enabled(struct hapd *hapd)
+hapd_ap_enabled(struct hapd *hapd)
 {
-    qca_hapd_sta_regen(hapd);
+    hapd_sta_regen(hapd);
 }
 
 static void
-qca_hapd_ap_disabled(struct hapd *hapd)
+hapd_ap_disabled(struct hapd *hapd)
 {
-    qca_hapd_sta_regen(hapd);
+    hapd_sta_regen(hapd);
 }
 
 static void
-qca_hapd_wps_active(struct hapd *hapd)
-{
-    util_cb_delayed_update(UTIL_CB_VIF, hapd->ctrl.bss);
-}
-
-static void
-qca_hapd_wps_success(struct hapd *hapd)
+hapd_wps_active(struct hapd *hapd)
 {
     util_cb_delayed_update(UTIL_CB_VIF, hapd->ctrl.bss);
 }
 
 static void
-qca_hapd_wps_timeout(struct hapd *hapd)
+hapd_wps_success(struct hapd *hapd)
 {
     util_cb_delayed_update(UTIL_CB_VIF, hapd->ctrl.bss);
 }
 
 static void
-qca_hapd_wps_disable(struct hapd *hapd)
+hapd_wps_timeout(struct hapd *hapd)
 {
     util_cb_delayed_update(UTIL_CB_VIF, hapd->ctrl.bss);
 }
 
 static void
-qca_wpas_connected(struct wpas *wpas, const char *bssid, int id, const char *id_str)
+hapd_wps_disable(struct hapd *hapd)
 {
-    qca_wpas_report(wpas);
+    util_cb_delayed_update(UTIL_CB_VIF, hapd->ctrl.bss);
 }
 
 static void
-qca_wpas_disconnected(struct wpas *wpas, const char *bssid, int reason, int local)
+wpas_connected(struct wpas *wpas, const char *bssid, int id, const char *id_str)
 {
-    qca_wpas_report(wpas);
+    wpas_report(wpas);
 }
 
 static void
-qca_hapd_ctrl_opened(struct ctrl *ctrl)
+wpas_disconnected(struct wpas *wpas, const char *bssid, int reason, int local)
+{
+    wpas_report(wpas);
+}
+
+static void
+hapd_ctrl_opened(struct ctrl *ctrl)
 {
     struct hapd *hapd = container_of(ctrl, struct hapd, ctrl);
-    qca_hapd_sta_regen(hapd);
+    hapd_sta_regen(hapd);
 }
 
 static void
-qca_hapd_ctrl_closed(struct ctrl *ctrl)
+hapd_ctrl_closed(struct ctrl *ctrl)
 {
     struct hapd *hapd = container_of(ctrl, struct hapd, ctrl);
-    qca_hapd_sta_regen(hapd);
+    hapd_sta_regen(hapd);
 }
 
 static void
-qca_wpas_ctrl_opened(struct ctrl *ctrl)
+wpas_ctrl_opened(struct ctrl *ctrl)
 {
     struct wpas *wpas = container_of(ctrl, struct wpas, ctrl);
-    qca_wpas_report(wpas);
+    wpas_report(wpas);
 }
 
 static void
-qca_wpas_ctrl_closed(struct ctrl *ctrl)
+wpas_ctrl_closed(struct ctrl *ctrl)
 {
     struct wpas *wpas = container_of(ctrl, struct wpas, ctrl);
-    qca_wpas_report(wpas);
+    wpas_report(wpas);
+}
+
+void dfs_update_chan_state(struct hapd *hapd, const int *chanlist, enum channel_state new_dfs_state)
+{
+    enum channel_state old_dfs_state = INVALID;
+
+    while (*chanlist) {
+        old_dfs_state = g_chan_status[*chanlist].state;
+
+        /* Channel in NOP_STARTED state should be changed to NOP_FINISHED state first
+         * before updating it to other DFS states.
+         * Eg: Needed if we ever hit a scenario where radar event(NOP_STARTED) is received
+         * first during CAC_STARTED period and then followed by a failed CAC_COMPLETED event.
+         */
+        if (g_chan_status[*chanlist].state == NOP_STARTED) {
+            if (new_dfs_state == NOP_FINISHED)
+                g_chan_status[*chanlist].state = new_dfs_state;
+        } else {
+            g_chan_status[*chanlist].state = new_dfs_state;
+        }
+
+        LOGW("%s: channel %d state updated %s -> %s",
+            __func__, *chanlist,
+            chan_state_to_str(old_dfs_state),
+            chan_state_to_str(g_chan_status[*chanlist].state));
+
+        chanlist++;
+    }
+    util_cb_vif_state_update(hapd->ctrl.bss);
+    util_cb_phy_state_update(hapd->phy);
+}
+
+static void hapd_dfs_event_cac_start(struct hapd *hapd, const char *event)
+{
+    char        *kv;
+    const char  *k;
+    const char  *v;
+    int         chan = 0;
+    int         cf1 = 0;
+    const int   *chan_list = NULL;
+    char        *parse_buf = strdupa(event);
+
+    /* Rely on centre channel seg0 to derive width as DFS_EVENT_CAC_START can send "width" with
+     * enum chan_width values or vht_oper_chwidth conf values which do not map to the same bw.
+     *
+     * DFS-CAC-START freq=5260 chan=52 sec_chan=0, width=0, seg0=0, seg1=0, cac_time=60s
+     * DFS-CAC-START freq=5260 chan=52 sec_chan=1, width=0, seg0=54, seg1=0, cac_time=60s
+     * DFS-CAC-START freq=5580 chan=116 sec_chan=1, width=1, seg0=122, seg1=0, cac_time=60s
+     */
+    while ((kv = strsep(&parse_buf, " "))) {
+        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+            if (!strcmp(k, "chan"))
+                chan = atoi(v);
+            else if (!strcmp(k, "seg0"))
+                cf1 = atoi(v);
+        }
+    }
+    if (chan) {
+        LOGI("%s: event[DFS-CAC-START %s]", __func__, event);
+        if (cf1)
+            chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
+        else
+            chan_list = unii_5g_chan2list(chan, 20);
+        if (chan_list)
+            dfs_update_chan_state(hapd, chan_list, CAC_STARTED);
+    }
+
+    return;
+}
+
+static void hapd_dfs_event_cac_completed(struct hapd *hapd, const char *event)
+{
+    char        *kv;
+    const char  *k;
+    const char  *v;
+    int         chan = 0;
+    int         cf1 = 0;
+    int         success = 0;
+    const int   *chan_list = NULL;
+    char        *parse_buf = strdupa(event);
+
+    /*
+     * DFS-CAC-COMPLETED success=0 freq=5580 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5610 cf2=0
+     * DFS-CAC-COMPLETED success=1 freq=5580 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5610 cf2=0
+     */
+    while ((kv = strsep(&parse_buf, " "))) {
+        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+            if (!strcmp(k, "freq"))
+                chan = util_freq_to_chan(atoi(v));
+            else if (!strcmp(k, "cf1"))
+                cf1 = util_freq_to_chan(atoi(v));
+            else if (!strcmp(k, "success"))
+                success = atoi(v);
+        }
+    }
+    if (chan) {
+        LOGI("%s: event[DFS-CAC-COMPLETED %s]", __func__, event);
+        if (cf1)
+            chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
+        if (chan_list) {
+            if (success)
+                dfs_update_chan_state(hapd, chan_list, CAC_COMPLETED);
+            else
+                dfs_update_chan_state(hapd, chan_list, NOP_FINISHED);
+        }
+    }
+
+    return;
+}
+
+static void hapd_dfs_event_radar_detected(struct hapd *hapd, const char *event)
+{
+    char        *kv;
+    const char  *k;
+    const char  *v;
+    int         chan = 0;
+    int         cf1 = 0;
+    const int   *chan_list = NULL;
+    char        *parse_buf = strdupa(event);
+
+    // DFS-RADAR-DETECTED freq=5580 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5610 cf2=0
+    while ((kv = strsep(&parse_buf, " "))) {
+        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+            if (!strcmp(k, "freq"))
+                chan = util_freq_to_chan(atoi(v));
+            else if (!strcmp(k, "cf1"))
+                cf1 = util_freq_to_chan(atoi(v));
+        }
+    }
+    if (chan) {
+        LOGI("%s: event[DFS-RADAR-DETECTED %s]", __func__, event);
+        if (cf1)
+            chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
+        if (chan_list)
+            dfs_update_chan_state(hapd, chan_list, NOP_STARTED);
+    }
+
+    return;
+}
+
+static void hapd_dfs_event_nop_finished(struct hapd *hapd, const char *event)
+{
+    char        *kv;
+    const char  *k;
+    const char  *v;
+    int         chan = 0;
+    int         cf1 = 0;
+    const int   *chan_list = NULL;
+    char        *parse_buf = strdupa(event);
+
+    // DFS_EVENT_NOP_FINISHED freq=5580 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5610 cf2=0
+    while ((kv = strsep(&parse_buf, " "))) {
+        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+            if (!strcmp(k, "freq"))
+                chan = util_freq_to_chan(atoi(v));
+            else if (!strcmp(k, "cf1"))
+                cf1 = util_freq_to_chan(atoi(v));
+        }
+    }
+    if (chan) {
+        LOGI("%s: event[DFS_EVENT_NOP_FINISHED %s]", __func__, event);
+        if (cf1)
+            chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
+        if (chan_list)
+            dfs_update_chan_state(hapd, chan_list, NOP_FINISHED);
+    }
+
+    return;
+}
+
+static void
+hapd_ap_csa_finished(struct hapd *hapd, const char *event)
+{
+    // AP-CSA-FINISHED freq=5180 dfs=0
+    LOGI("%s: event[AP-CSA-FINISHED %s]", __func__, event);
+
+    util_cb_vif_state_update(hapd->ctrl.bss);
+    util_cb_phy_state_update(hapd->phy);
 }
 
 /* target -> target */
 
 static void
-qca_ctrl_discover(const char *bss)
+hostap_ctrl_discover(const char *bss)
 {
     struct hapd *hapd = hapd_lookup(bss);
     struct wpas *wpas = wpas_lookup(bss);
@@ -1471,24 +1585,29 @@ qca_ctrl_discover(const char *bss)
         return;
 
     if (phy)
-        util_iwconfig_get_opmode(bss, mode, sizeof(mode));
+        util_get_opmode(bss, mode, sizeof(mode));
 
     if (!strcmp(mode, "ap")) {
         if (wpas) ctrl_disable(&wpas->ctrl);
         if (!hapd) hapd = hapd_new(phy, bss);
         if (WARN_ON(!hapd)) return;
         STRSCPY_WARN(hapd->driver, "nl80211");
-        hapd->ctrl.opened = qca_hapd_ctrl_opened;
-        hapd->ctrl.closed = qca_hapd_ctrl_closed;
-        hapd->ctrl.overrun = qca_hapd_ctrl_opened;
-        hapd->sta_connected = qca_hapd_sta_connected;
-        hapd->sta_disconnected = qca_hapd_sta_disconnected;
-        hapd->ap_enabled = qca_hapd_ap_enabled;
-        hapd->ap_disabled = qca_hapd_ap_disabled;
-        hapd->wps_active = qca_hapd_wps_active;
-        hapd->wps_success = qca_hapd_wps_success;
-        hapd->wps_timeout = qca_hapd_wps_timeout;
-        hapd->wps_disable = qca_hapd_wps_disable;
+        hapd->ctrl.opened = hapd_ctrl_opened;
+        hapd->ctrl.closed = hapd_ctrl_closed;
+        hapd->ctrl.overrun = hapd_ctrl_opened;
+        hapd->sta_connected = hapd_sta_connected;
+        hapd->sta_disconnected = hapd_sta_disconnected;
+        hapd->ap_enabled = hapd_ap_enabled;
+        hapd->ap_disabled = hapd_ap_disabled;
+        hapd->wps_active = hapd_wps_active;
+        hapd->wps_success = hapd_wps_success;
+        hapd->wps_timeout = hapd_wps_timeout;
+        hapd->wps_disable = hapd_wps_disable;
+        hapd->dfs_event_cac_start = hapd_dfs_event_cac_start;
+        hapd->dfs_event_cac_completed = hapd_dfs_event_cac_completed;
+        hapd->dfs_event_radar_detected = hapd_dfs_event_radar_detected;
+        hapd->dfs_event_nop_finished = hapd_dfs_event_nop_finished;
+        hapd->ap_csa_finished = hapd_ap_csa_finished;
         hapd->respect_multi_ap = 1;
         hapd->ieee80211n = 1;
         hapd->ieee80211ac = 1;
@@ -1503,11 +1622,11 @@ qca_ctrl_discover(const char *bss)
         if (!wpas) wpas = wpas_new(phy, bss);
         if (WARN_ON(!wpas)) return;
         STRSCPY_WARN(wpas->driver, "nl80211");
-        wpas->ctrl.opened = qca_wpas_ctrl_opened;
-        wpas->ctrl.closed = qca_wpas_ctrl_closed;
-        wpas->ctrl.overrun = qca_wpas_ctrl_opened;
-        wpas->connected = qca_wpas_connected;
-        wpas->disconnected = qca_wpas_disconnected;
+        wpas->ctrl.opened = wpas_ctrl_opened;
+        wpas->ctrl.closed = wpas_ctrl_closed;
+        wpas->ctrl.overrun = wpas_ctrl_opened;
+        wpas->connected = wpas_connected;
+        wpas->disconnected = wpas_disconnected;
         wpas->respect_multi_ap = 1;
         ctrl_enable(&wpas->ctrl);
         wpas = NULL;
@@ -1518,7 +1637,7 @@ qca_ctrl_discover(const char *bss)
 }
 
 static void
-qca_ctrl_destroy(const char *bss)
+hostap_ctrl_destroy(const char *bss)
 {
     struct hapd *hapd = hapd_lookup(bss);
     struct wpas *wpas = wpas_lookup(bss);
@@ -1527,7 +1646,7 @@ qca_ctrl_destroy(const char *bss)
 }
 
 static void
-qca_ctrl_wps_session(const char *bss, int wps, int wps_pbc)
+hostap_ctrl_wps_session(const char *bss, int wps, int wps_pbc)
 {
     struct hapd *hapd = hapd_lookup(bss);
 
@@ -1545,7 +1664,7 @@ qca_ctrl_wps_session(const char *bss, int wps, int wps_pbc)
 }
 
 static void
-qca_ctrl_apply(const char *bss,
+hostap_ctrl_apply(const char *bss,
                const struct schema_Wifi_VIF_Config *vconf,
                const struct schema_Wifi_Radio_Config *rconf,
                const struct schema_Wifi_Credential_Config *cconf,
@@ -1581,85 +1700,8 @@ qca_ctrl_apply(const char *bss,
 }
 
 /******************************************************************************
- * iwpriv helpers
+ * hostapd helpers
  *****************************************************************************/
-
-static const struct util_iwpriv_mode {
-    const char *hwmode;
-    const char *htmode;
-    const char *bands[4];
-    const char *iwpriv_modes[4];
-} util_iwpriv_mode_map[] = {
-    /* This is simplified. We don't really expect any other
-     * combinations for now.
-     */
-    { "11g",  "HT20", { "2.4G" }, { "11G" } },
-    { "11b",  "HT20", { "2.4G" }, { "11B" } },
-    { "11n",  "HT20", { "2.4G" }, { "11NGHT20" } },
-    { "11n",  "HT40", { "2.4G" }, { "11NGHT40", "11NGHT40MINUS", "11NGHT40PLUS" } },
-    { "11n",  "HT20", { "5G", "5GU", "5GL" }, { "11NAHT20" } },
-    { "11n",  "HT40", { "5G", "5GU", "5GL" }, { "11NAHT40", "11NAHT40MINUS", "11NAHT40PLUS" } },
-    { "11ac", "HT20", { "5G", "5GU", "5GL" }, { "11ACVHT20" } },
-    { "11ac", "HT40", { "5G", "5GU", "5GL" }, { "11ACVHT40", "11ACVHT40MINUS", "11ACVHT40PLUS" } },
-    { "11ac", "HT80", { "5G", "5GU", "5GL" }, { "11ACVHT80" } },
-    { "11ac", "HT160", { "5G", "5GU", "5GL" }, { "11ACVHT160" } },
-    { "11ac", "HT80+80", { "5G", "5GU", "5GL" }, { "11ACVHT80_80" } },
-    { "11ax", "HT20", { "2.4G" }, { "11GHE20" } },
-    { "11ax", "HT40", { "2.4G" }, { "11GHE40", "11GHE40PLUS", "11GHE40MINUS" } },
-    { "11ax", "HT20", { "5G", "5GU", "5GL" }, { "11AHE20" } },
-    { "11ax", "HT40", { "5G", "5GU", "5GL" }, { "11AHE40", "11AHE40PLUS", "11AHE40MINUS" } },
-    { "11ax", "HT80", { "5G", "5GU", "5GL" }, { "11AHE80" } },
-    { "11ax", "HT160", { "5G", "5GU", "5GL" }, { "11AHE160" } },
-    { "11ax", "HT160", { "5G", "5GU", "5GL" }, { "11AHE80_80" } },
-    { NULL, NULL, {}, {} }, /* array guard, keep last */
-};
-
-static int
-util_qca_get_mode(const char *hwmode,
-                     const char *htmode,
-                     const char *freq_band,
-                     char *buf,
-                     int len)
-{
-    const struct util_iwpriv_mode *i;
-    const char *const*band;
-
-    memset(buf, 0, len);
-    for (i = util_iwpriv_mode_map; i->hwmode; i++)
-        for (band = i->bands; *band; band++)
-            if (!strcmp(*band, freq_band) &&
-                !strcmp(i->hwmode, hwmode) &&
-                !strcmp(i->htmode, htmode))
-                strscpy(buf, i->iwpriv_modes[0], len);
-
-    return strlen(buf) > 0 ? 0 : -1;
-}
-
-static const struct util_iwpriv_mode *
-util_qca_lookup_mode(const char *iwpriv_mode)
-{
-    const struct util_iwpriv_mode *i;
-    const char *const*mode;
-
-    for (i = util_iwpriv_mode_map; i->hwmode; i++)
-        for (mode = i->iwpriv_modes; *mode; mode++)
-            if (!strcmp(*mode, iwpriv_mode))
-                return i;
-
-    return NULL;
-}
-
-static bool
-util_qca_get_int(const char *ifname, const char *iwprivname, int *v)
-{
-    return qca_get_int( ifname, iwprivname, v);
-}
-
-int
-util_qca_set_int(const char *ifname, const char *iwprivname, int v)
-{
-    return qca_set_int(ifname, iwprivname, v);
-}
 
 int hostapd_mac_acl_clear(const char *phy, const char *vif)
 {
@@ -1697,7 +1739,7 @@ bool hostapd_mac_acl_accept_add(const char *phy, const char *vif, const char *ma
 
     hostapd_mac_acl_clear(phy, vif);
 
-    for_each_iwpriv_mac(mac, (p = strdup(mac_list_buf))) {
+    for_each_mac(mac, (p = strdup(mac_list_buf))) {
         snprintf(hostapd_cmd, sizeof(hostapd_cmd),
             "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
             "ACCEPT_ACL ADD_MAC %s",
@@ -1725,7 +1767,7 @@ bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_
 
     hostapd_mac_acl_clear(phy, vif);
 
-    for_each_iwpriv_mac(mac, (p = strdup(mac_list_buf))) {
+    for_each_mac(mac, (p = strdup(mac_list_buf))) {
         snprintf(hostapd_cmd, sizeof(hostapd_cmd),
             "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
             "DENY_ACL ADD_MAC %s",
@@ -1762,6 +1804,7 @@ bool util_hostapd_get_mac_acl(const char *phy,
 {
     char *accept_buf = NULL;
     char *deny_buf = NULL;
+    char *buf = NULL;
     char sockdir[64];
     char *line;
     char *mac_addr;
@@ -1782,12 +1825,17 @@ bool util_hostapd_get_mac_acl(const char *phy,
     else
         return false;
 
-    while ((line = strsep((strlen(deny_buf) > 0) ? &deny_buf : &accept_buf, "\n")))
-        if (!isspace(line[0]) && (mac_addr = strsep(&line, " ")))
+    if (strlen(deny_buf) > 0)
+        buf = strdupa(deny_buf);
+    else
+        buf = strdupa(accept_buf);
+
+    while (line = strsep(&buf, "\n"))
+        if (mac_addr = strsep(&line, " "))
             if (strlen(mac_addr) > 0) {
                 STRSCPY(vstate->mac_list[vstate->mac_list_len], mac_addr);
                 vstate->mac_list_len++;
-        }
+            }
 
     return true;
 }
@@ -1839,42 +1887,38 @@ bool util_hostapd_get_hw_mode(const char *phy, char *buf, int buf_len)
 }
 
 static int
-util_qca_set_int_lazy(const char *device_ifname,
-                         const char *iwpriv_get,
-                         const char *iwpriv_set,
+util_get_mode(const char *hwmode,
+              const char *htmode,
+              const char *freq_band,
+              char *buf,
+              int len)
+{
+    LOGN("%s: Unsupported get mode command for %s %s %s", __func__, hwmode, htmode, freq_band);
+    return -1;
+}
+
+static int
+util_set_int_lazy(const char *device_ifname,
+                         const char *param_get,
+                         const char *param_set,
                          int v)
 {
     bool ok;
     int o;
 
-    ok = util_qca_get_int(device_ifname, iwpriv_get, &o);
-    if (!ok) {
-        LOGW("%s: failed to get iwpriv int '%s'",
-             device_ifname, iwpriv_get);
+    ok = util_get_int(device_ifname, param_get, &o);
+    if (!ok)
         return -1;
-    }
 
-    if (v == o) {
-        LOGT("%s: not setting '%s', already at desired value %d",
-             device_ifname, iwpriv_set, v);
+    if (v == o)
         return 0;
-    }
 
-    LOGI("%s: setting '%s' = %d", device_ifname, iwpriv_set, v);
-    return util_qca_set_int(device_ifname, iwpriv_set, v);
-}
-
-static int
-util_qca_set_str_lazy(const char *device_ifname,
-                         const char *iwpriv_get,
-                         const char *iwpriv_set,
-                         const char *v)
-{
-    return qca_set_str_lazy(device_ifname, iwpriv_get, iwpriv_set, v);
+    LOGI("%s: setting '%s' = %d", device_ifname, param_set, v);
+    return util_set_int(device_ifname, param_set, v);
 }
 
 static bool
-util_qca_get_bcn_int(const char *phy, int *v)
+util_get_bcn_int(const char *phy, int *v)
 {
     char *vif;
     int err;
@@ -1883,75 +1927,21 @@ util_qca_get_bcn_int(const char *phy, int *v)
     if (err)
         return false;
 
-    return util_qca_get_int(vif, "get_bintval", v);
+    return util_get_int(vif, "get_bintval", v);
 }
 
 static bool
-util_qca_get_ht_mode(const char *vif, char *htmode, int htmode_len)
+util_get_ht_mode(const char *vif, char *htmode, int htmode_len)
 {
     return nl_req_get_ht_mode(vif, htmode, htmode_len);
 }
-
-#if 0
-/*
- * The issue specific to "*scanfilter*" command is fixed in
- * the driver so this code is not required.
- */
-static void
-util_qca_set_scanfilter(const char *vif,
-                           const char *ssid)
-{
-    /* FIXME:
-     *
-     *  * Driver implementation is exact-match based. Given
-     *    Credential_Config can express multiple different
-     *    ssids this needs to be revised in driver.
-     *
-     *  * Apparently since Credential_Config was introduced
-     *    scanfilter can't be working during onboarding
-     *    because vconf->ssid is empty at that point.
-     *
-     * Below code currently works only after onboarding when
-     * cloud tells what parent to connect to.
-     */
-
-    WARN(-1 == util_qca_set_int_lazy(vif,
-                                        "gscanfilter",
-                                        "scanfilter",
-                                        2 /* sort-first */),
-         "%s: failed to set scanfilter: %d (%s)",
-         vif, errno, strerror(errno));
-
-    WARN(-1 == util_qca_set_str_lazy(vif,
-                                        "gscanfilterssid",
-                                        "scanfilterssid",
-                                        ssid),
-         "%s: failed to set scanfilterssid(%s): %d (%s)",
-         vif, ssid, errno, strerror(errno));
-}
-#endif
 
 /******************************************************************************
  * thermal helpers
  *****************************************************************************/
 
-struct util_thermal {
-    ev_timer timer;
-    struct ds_dlist_node list;
-    const char **type;
-    char phy[32];
-    int period_sec;
-    int tx_chainmask_capab;
-    int tx_chainmask_limit;
-    int should_downgrade;
-    int temp_upgrade;
-    int temp_downgrade;
-};
-
-static ds_dlist_t g_thermal_list = DS_DLIST_INIT(struct util_thermal, list);
-
 static const char **
-util_thermal_get_qca_names(const char *phy)
+util_thermal_get_names(const char *phy)
 {
     static const char *hard[] = { "get_txchainmask", "txchainmask" };
 
@@ -1968,7 +1958,7 @@ util_thermal_phy_is_downgraded(const struct util_thermal *t)
     if (__builtin_popcount(t->tx_chainmask_limit) == 1)
         return false;
 
-    ok = util_qca_get_int(t->phy, t->type[0], &v);
+    ok = util_get_int(t->phy, t->type[0], &v);
     if (!ok)
         return false;
 
@@ -1987,7 +1977,7 @@ util_thermal_get_temp(const char *phy, int *temp)
     err = readcmd(buf, sizeof(buf), 0, "cat /sys/class/net/%s/thermal/temp", phy);
     if (err) {
         LOGW("%s: readcmd() failed: %d (%s)", phy, errno, strerror(errno));
-        return IOCTL_STATUS_ERROR;
+        return -1;
     }
 
     *temp = atoi(buf);
@@ -2057,7 +2047,7 @@ util_thermal_get_chainmask_capab(const char *phy)
     bool ok;
     int v;
 
-    ok = util_qca_get_int(phy, "get_rxchainmask", &v);
+    ok = util_get_int(phy, "get_rxchainmask", &v);
     if (!ok) {
         LOGW("%s: failed to get chainmask capability: %d (%s), assuming 1",
              phy, errno, strerror(errno));
@@ -2098,8 +2088,8 @@ util_thermal_phy_recalc_tx_chainmask(const char *phy,
             mask = masks[n];
 
     STRSCPY(ifname, phy);
-    type = util_thermal_get_qca_names(phy);
-    err = util_qca_set_int_lazy(phy, type[0], type[1], mask);
+    type = util_thermal_get_names(phy);
+    err = util_set_int_lazy(phy, type[0], type[1], mask);
     if (err) {
         LOGW("%s: failed to set tx chainmask: %d (%s)",
              phy, errno, strerror(errno));
@@ -2220,7 +2210,7 @@ util_thermal_config_set(const struct schema_Wifi_Radio_Config *rconf)
                           ? rconf->tx_chainmask
                           : 0;
     t->should_downgrade = false;
-    t->type = util_thermal_get_qca_names(rconf->if_name);
+    t->type = util_thermal_get_names(rconf->if_name);
 
     if (rconf->thermal_integration_exists &&
         rconf->thermal_downgrade_temp_exists &&
@@ -2261,35 +2251,36 @@ util_thermal_config_set(const struct schema_Wifi_Radio_Config *rconf)
  * BM and BSAL
  *****************************************************************************/
 
-#if 0
 int
 target_bsal_init(bsal_event_cb_t event_cb, struct ev_loop *loop)
 {
-    return qca_bsal_init(event_cb, loop);
+    return nl_bsal_init(event_cb, loop);
 }
 
 int
 target_bsal_cleanup(void)
 {
-    return qca_bsal_cleanup();
+    return nl_bsal_cleanup();
 }
 
 int
 target_bsal_iface_add(const bsal_ifconfig_t *ifcfg)
 {
-    return qca_bsal_iface_add(ifcfg);
+    return nl_bsal_iface_add(ifcfg);
 }
 
+#if 0
 int
 target_bsal_iface_update(const bsal_ifconfig_t *ifcfg)
 {
-    return qca_bsal_iface_update(ifcfg);
+    return nl_bsal_iface_update(ifcfg);
 }
+#endif
 
 int
 target_bsal_iface_remove(const bsal_ifconfig_t *ifcfg)
 {
-    return qca_bsal_iface_remove(ifcfg);
+    return nl_bsal_iface_remove(ifcfg);
 }
 
 int
@@ -2297,7 +2288,7 @@ target_bsal_client_add(const char *ifname,
                        const uint8_t *mac_addr,
                        const bsal_client_config_t *conf)
 {
-    return qca_bsal_client_add(ifname, mac_addr, conf);
+    return nl_bsal_client_add(ifname, mac_addr, conf);
 }
 
 int
@@ -2305,21 +2296,21 @@ target_bsal_client_update(const char *ifname,
                           const uint8_t *mac_addr,
                           const bsal_client_config_t *conf)
 {
-    return qca_bsal_client_update(ifname, mac_addr, conf);
+    return nl_bsal_client_update(ifname, mac_addr, conf);
 }
 
 int
 target_bsal_client_remove(const char *ifname,
                           const uint8_t *mac_addr)
 {
-    return qca_bsal_client_remove(ifname, mac_addr);
+    return nl_bsal_client_remove(ifname, mac_addr);
 }
 
 int
 target_bsal_client_measure(const char *ifname,
                            const uint8_t *mac_addr, int num_samples)
 {
-    return qca_bsal_client_measure(ifname, mac_addr, num_samples);
+    return nl_bsal_client_measure(ifname, mac_addr, num_samples);
 }
 
 int
@@ -2327,29 +2318,21 @@ target_bsal_client_info(const char *ifname,
                         const uint8_t *mac_addr,
                         bsal_client_info_t *info)
 {
-    return qca_bsal_client_info(ifname, mac_addr, info);
-}
-
-bool
-target_client_disconnect(const char *interface, const char *disc_type,
-                         const char *mac_str, uint8_t reason)
-{
-    return hostapd_client_disconnect(HOSTAPD_CONTROL_PATH_DEFAULT,
-                                     interface, disc_type, mac_str, reason);
+    return nl_bsal_client_info(ifname, mac_addr, info);
 }
 
 int
 target_bsal_client_disconnect(const char *ifname, const uint8_t *mac_addr,
                               bsal_disc_type_t type, uint8_t reason)
 {
-    return qca_bsal_client_disconnect(ifname, mac_addr, type, reason);
+    return nl_bsal_client_disconnect(ifname, mac_addr, type, reason);
 }
 
 int
 target_bsal_bss_tm_request(const char *ifname,
                            const uint8_t *mac_addr, const bsal_btm_params_t *btm_params)
 {
-    return qca_bsal_bss_tm_request(ifname, mac_addr, btm_params);
+    return nl_bsal_bss_tm_request(ifname, mac_addr, btm_params);
 }
 
 int
@@ -2357,315 +2340,23 @@ target_bsal_rrm_beacon_report_request(const char *ifname,
                                       const uint8_t *mac_addr,
                                       const bsal_rrm_params_t *rrm_params)
 {
-    return qca_bsal_rrm_beacon_report_request(ifname, mac_addr, rrm_params);
+    return nl_bsal_rrm_beacon_report_request(ifname, mac_addr, rrm_params);
 }
 
 int target_bsal_rrm_set_neighbor(const char *ifname, const bsal_neigh_info_t *nr)
 {
-    return qca_bsal_rrm_set_neighbor(ifname, nr);
+    return nl_bsal_rrm_set_neighbor(ifname, nr);
 }
 
 int target_bsal_rrm_remove_neighbor(const char *ifname, const bsal_neigh_info_t *nr)
 {
-    return qca_bsal_rrm_remove_neighbor(ifname, nr);
+    return nl_bsal_rrm_remove_neighbor(ifname, nr);
 }
 
 int target_bsal_send_action(const char *ifname, const uint8_t *mac_addr,
                          const uint8_t *data, unsigned int data_len)
 {
-    return qca_bsal_send_action(ifname, mac_addr, data, data_len);
-}
-#endif
-
-/******************************************************************************
- * CSA
- *****************************************************************************/
-
-#define EXTTOOL_CW_20 0
-#define EXTTOOL_CW_40 1
-#define EXTTOOL_CW_80 2
-#define EXTTOOL_CW_160 3
-#define EXTTOOL_CW_DEFAULT EXTTOOL_CW_20
-
-#define EXTTOOL_HT40_PLUS_STR "CU"
-#define EXTTOOL_HT40_MINUS_STR "CL"
-#define EXTTOOL_HT40_PLUS 1
-#define EXTTOOL_HT40_MINUS 3
-#define EXTTOOL_HT40_DEFAULT EXTTOOL_HT40_PLUS
-
-#define CSA_COUNT 15
-
-static const int *
-util_get_channels(const char *phy, int chan, const char *mode)
-{
-    unsigned int width;
-
-    /* TODO add support for HT80+80 if we will support this */
-    WARN_ON(strcmp(mode, "HT80+80") == 0);
-
-    if (sscanf(mode, "HT%u", &width) != 1) {
-        width = 20;
-        LOGW("%s: failed to get channel width '%s' return default %d",
-             phy, mode, width);
-    }
-
-    return unii_5g_chan2list(chan, width);
-}
-
-static int
-util_csa_get_chwidth(const char *phy, const char *mode)
-{
-    if (!strcmp(mode, "HT20"))
-        return EXTTOOL_CW_20;
-    if (!strcmp(mode, "HT40"))
-        return EXTTOOL_CW_40;
-    if (!strcmp(mode, "HT80"))
-        return EXTTOOL_CW_80;
-    if (!strcmp(mode, "HT160"))
-        return EXTTOOL_CW_160;
-
-    LOGW("%s: failed to get channel width, defaulting to: %d",
-         phy, EXTTOOL_CW_DEFAULT);
-    return EXTTOOL_CW_DEFAULT;
-}
-
-static int
-util_csa_is_sec_offset_supported(const char *phy,
-                              int channel,
-                              const char *offset_str)
-{
-    char *buf;
-    char buffer[4096];
-    char file[4096];
-    char *line, *chan;
-
-    snprintf(buffer, sizeof(buffer), CONFIG_INSTALL_PREFIX"/bin/chan_width.sh %s", phy);
-    system(buffer);
-    snprintf(file, sizeof(file), "/tmp/chan_width_1.txt");
-    buf = strexa("cat", file);
-
-    while ((line = strsep(&buf, "\n"))) {
-        if (!(chan = strsep(&line, " "))) {
-            continue;
-        }
-        if (!(atoi(chan) == channel)) {
-            continue;
-        }
-        if (strstr(line, offset_str))
-            return 1;
-        else
-            return 0;
-    }
-    return 0;
-}
-
-static int
-util_csa_get_secoffset(const char *phy, int channel)
-{
-    if (util_csa_is_sec_offset_supported(phy, channel, EXTTOOL_HT40_PLUS_STR))
-        return EXTTOOL_HT40_PLUS;
-
-    if (util_csa_is_sec_offset_supported(phy, channel, EXTTOOL_HT40_MINUS_STR))
-        return EXTTOOL_HT40_MINUS;
-
-    LOGW("%s: failed to find suitable csa channel offset, defaulting to: %d",
-         phy, EXTTOOL_HT40_DEFAULT);
-    return EXTTOOL_HT40_DEFAULT;
-}
-
-static bool
-util_csa_chan_is_supported(const char *vif, int chan)
-{
-    /* TODO: Currently OVSDB isn't able to express more than a mere channel
-     * number for CSA. This means all other info (width, cfreq, secondary) are
-     * implied automatically. This can work for 5G ok, but 2G is ambiguous.
-     *
-     * No sense to make this any smarter even though HAL event delivers more
-     * than channel number. This is just something that can be improved later.
-     */
-    return wlanconfig_nl80211_is_supported(vif, chan);
-}
-
-static int
-util_csa_chan_get_capable_phy(char *phy, int len, int chan)
-{
-    char vif[32];
-    struct dirent *p;
-    int err;
-    DIR *d;
-
-    if (!(d = opendir("/sys/class/net"))) {
-        LOGW("%s: failed to opendir: %d (%s)",
-             __func__, errno, strerror(errno));
-        return -1;
-    }
-
-    errno = ENOENT;
-    err = -1;
-    for (p = readdir(d); p; p = readdir(d)) {
-        if (strstr(p->d_name, "wifi") != p->d_name)
-            continue;
-
-        if (util_wifi_any_phy_vif(p->d_name, vif, sizeof(vif)))
-            continue;
-
-        if (!util_csa_chan_is_supported(vif, chan))
-            continue;
-
-        strscpy(phy, p->d_name, len);
-        err = 0;
-        break;
-    }
-
-    closedir(d);
-    return err;
-}
-
-static void
-util_csa_do_implicit_parent_switch(const char *vif,
-                                   const char *bssid,
-                                   int chan)
-{
-    static const char zeroaddr[6] = {};
-    char phy[32];
-    char bssid_arg[32];
-    int err;
-
-    snprintf(bssid_arg, sizeof(bssid_arg),
-             "%02hx:%02hx:%02hx:%02hx:%02hx:%02hx",
-             bssid[0], bssid[1], bssid[2],
-             bssid[3], bssid[4], bssid[5]);
-
-    if (!memcmp(zeroaddr, bssid, 6)) {
-        LOGW("%s: bssid is missing, parent switch will take longer",
-             vif);
-        bssid_arg[0] = 0;
-    }
-
-    if ((err = util_csa_chan_get_capable_phy(phy,
-                                             sizeof(phy),
-                                             chan))) {
-        LOGW("%s: failed to get capable phy for chan %d: %d (%s)",
-             __func__, chan, errno, strerror(errno));
-        return;
-    }
-
-    err = runcmd("%s/parentchange.sh '%s' '%s' '%d'",
-                 target_bin_dir(),
-                 phy,
-                 bssid_arg,
-                 chan);
-    if (err) {
-        LOGW("%s: failed to run parentchange.sh '%s' '%s' '%d': %d (%s)",
-             __func__,
-             phy,
-             bssid_arg,
-             chan,
-             errno,
-             strerror(errno));
-    }
-}
-
-static void
-util_csa_completion_check_vif(const char *vif)
-{
-    char *phy;
-    int err;
-
-    err = util_wifi_get_parent(vif, phy = A(32));
-    if (err) {
-        LOGW("%s: failed to get parent radio name: %d (%s)",
-             vif, errno, strerror(errno));
-        return;
-    }
-
-    util_cb_delayed_update(UTIL_CB_VIF, vif);
-    util_cb_delayed_update(UTIL_CB_PHY, phy);
-}
-
-static int
-util_cac_in_progress(const char *phy)
-{
-    const char *line;
-    char *buf;
-
-    if (WARN_ON(!(buf = strexa("exttool", "--interface", phy, "--list"))))
-        return 0;
-
-    while ((line = strsep(&buf, "\r\n")))
-        if (strstr(line, "DFS_CAC_STARTED"))
-            return 1;
-
-    return 0;
-}
-
-static int
-util_csa_start(const char *phy,
-               const char *vif,
-               const char *hw_mode,
-               const char *freq_band,
-               const char *ht_mode,
-               int channel)
-{
-    char mode[32];
-    char cmd[1024];
-    int err;
-
-    if (util_cac_in_progress(phy)) {
-        LOGI("%s: cac in progress, switching channel through down/up", phy);
-        memset(mode, 0, sizeof(mode));
-        err = 0;
-        err |= WARN_ON(!strexa("ifconfig", vif, "down"));
-        err |= WARN_ON(util_qca_get_mode(hw_mode, ht_mode, freq_band, mode, sizeof(mode)) < 0);
-        err |= WARN_ON(util_qca_set_str_lazy(vif, "get_mode", "mode", mode) < 0);
-        err |= WARN_ON(!strexa("iwconfig", vif, "channel", strfmta("%d", channel)));
-        err |= WARN_ON(!strexa("ifconfig", vif, "up"));
-        return err ? -1 : 0;
-    }
-
-    sprintf(cmd, "exttool --chanswitch --interface %s --chan %d --numcsa %d --chwidth %d --secoffset %d", phy, channel, CSA_COUNT, util_csa_get_chwidth(phy, ht_mode), util_csa_get_secoffset(phy, channel));
-
-    err = system(cmd);
-
-#if 0
-    err = runcmd("exttool --chanswitch --interface %s --chan %d --numcsa %d --chwidth %d --secoffset %d",
-                 phy,
-                 channel,
-                 CSA_COUNT,
-                 util_csa_get_chwidth(phy, ht_mode),
-                 util_csa_get_secoffset(phy, channel));
-#endif
-    if (err) {
-        LOGW("%s: failed to run exttool; is csa already running? invalid channel? nop active?",
-             phy);
-        return err;
-    }
-
-    /* TODO: A timer should be armed to detect if CSA failed
-     * to complete.
-     */
-
-    return 0;
-}
-
-static void
-util_csa_war_update_rconf_channel(const char *phy, int chan)
-{
-    const char *get = F("%s/../tools/ovsh -r s Wifi_Radio_Config -w channel!=%d -w if_name==%s | grep .",
-                        target_bin_dir(), chan, phy);
-    const char *cmd = F("%s/../tools/ovsh u Wifi_Radio_Config channel:=%d -w if_name==%s | grep 1",
-                        target_bin_dir(), chan, phy);
-    int err;
-    if ((system(get)))
-        return;
-
-    /* FIXME: This is a deficiency in the API which is bound to ovsdb
-     * and the ambiguity of Wifi_Radio_Config channel with regard to
-     * possible STA uplink.
-     */
-    LOGI("%s: overriding with channel %d on CSA Rx leaf", phy, chan);
-    if ((err = system(cmd)))
-        LOGEM("%s: system(%s) failed: %d, expect topology deviation", phy, cmd, err);
+    return nl_bsal_send_action(ifname, mac_addr, data, data_len);
 }
 
 /******************************************************************************
@@ -2689,31 +2380,6 @@ util_csa_war_update_rconf_channel(const char *phy, int chan)
     util_nl_each_attr(hdr, attr, attrlen) \
         if (attr->rta_type == type)
 
-#define util_nl_iwe_data(iwe) \
-    ((void *)(iwe) + IW_EV_LCP_LEN)
-
-#define util_nl_iwe_payload(iwe) \
-    ((iwe)->len - IW_EV_POINT_LEN)
-
-#define util_nl_iwe_next(iwe, iwelen) \
-    ( (iwelen) -= (iwe)->len, (void *)(iwe) + (iwe)->len )
-
-#define util_nl_iwe_ok(iwe, iwelen) \
-    ((iwelen) >= (iwe)->len && (iwelen) > 0)
-
-#define util_nl_each_iwe(attr, iwe, iwelen) \
-    for (iwe = RTA_DATA(attr), \
-         iwelen = RTA_PAYLOAD(attr); \
-         util_nl_iwe_ok(iwe, iwelen); \
-         iwe = util_nl_iwe_next(iwe, iwelen))
-
-#define util_nl_each_iwe_type(attr, iwe, iwelen, type) \
-    util_nl_each_iwe(attr, iwe, iwelen) \
-        if (iwe->cmd == type)
-
-static int util_nl_fd = -1;
-static ev_io util_nl_io;
-
 static void
 util_nl_listen_stop(void)
 {
@@ -2722,206 +2388,6 @@ util_nl_listen_stop(void)
     util_nl_fd = -1;
 }
 
-static void
-util_nl_parse_iwevcustom_chan_change(const char *ifname,
-                                     const void *data,
-                                     int len)
-{
-    const unsigned char *c = data;
-
-    LOGI("%s: channel changed to %d", ifname, (int)*c);
-    util_csa_completion_check_vif(ifname);
-}
-
-#ifdef EXQCA
-static void
-util_nl_parse_iwevcustom_csa_rx(const char *ifname,
-                                const void *data,
-                                int len)
-{
-    const struct ieee80211_csa_rx_ev *ev;
-    bool supported;
-    char vif[32];
-
-    ev = data;
-
-    if ((int)sizeof(*ev) > len) {
-        LOGW("%s: csa rx event too small (%d, should be at least %zu), check your ABI",
-             ifname, len, sizeof(*ev));
-        return;
-    }
-
-    if (util_wifi_any_phy_vif(ifname, vif, sizeof(vif))) {
-        LOGW("%s: failed to find at least 1 vap", ifname);
-        return;
-    }
-
-    supported = util_csa_chan_is_supported(vif, ev->chan);
-    LOGI("%s: csa rx to bssid %02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx chan %d width %dMHz sec %d cfreq2 %d valid %d supported %d",
-         ifname,
-         ev->bssid[0], ev->bssid[1], ev->bssid[2],
-         ev->bssid[3], ev->bssid[4], ev->bssid[5],
-         ev->chan, ev->width_mhz, ev->secondary,
-         ev->cfreq2_mhz, ev->valid, supported);
-
-    if (supported && ev->valid) {
-        util_csa_war_update_rconf_channel(ifname, ev->chan);
-        return;
-    }
-
-    if (supported != ev->valid)
-        LOGW("%s: csa rx mismatch (supported != ev->valid)", ifname);
-
-    /* This is intended to support Caesar as leaf connected
-     * to Piranha parent. Piranha parent can move between
-     * 5GU and 5GL as far as Caesar is concerned.
-     *
-     * This hides the complexity from the cloud. Arguably
-     * wrong way around it, but the proper way is a bit more
-     * involved so this is a make-shift solution.
-     */
-    util_csa_do_implicit_parent_switch(ifname, ev->bssid, ev->chan);
-}
-#endif
-
-static void
-util_nl_parse_iwevcustom_channel_list_updated(const char *phy,
-                                              const void *data,
-                                              unsigned int len)
-{
-    const unsigned char *chan;
-
-    if (len < sizeof(*chan)) {
-        LOGW("%s: channel list updated event too short (%d < %zu), userspace/driver abi mismatch?", phy, len, sizeof(*chan));
-        return;
-    }
-
-    chan = data;
-    LOGI("%s: channel list updated, chan %d", phy, *chan);
-    util_cb_delayed_update(UTIL_CB_PHY, phy);
-}
-
-static bool
-util_wifi_phy_has_sta(const char *phy)
-{
-    char vifs[1024];
-    char *vifr;
-    char *vif;
-
-    if (util_wifi_get_phy_vifs(phy, vifs, sizeof(vifs)) < 0) {
-        LOGW("%s: failed to get phy vif list: %d (%s)", phy, errno, strerror(errno));
-        return false;
-    }
-
-    for (vif = strtok_r(vifs, " ", &vifr); vif; vif = strtok_r(NULL, " ", &vifr)) {
-        if (strstr(vif, "bhaul-sta"))
-            return true;
-    }
-
-    return false;
-}
-
-static void
-util_nl_parse_iwevcustom_radar_detected(const char *phy,
-                                        const void *data,
-                                        unsigned int len)
-{
-    const unsigned char *chan;
-    const char *fallback_phy;
-    struct fallback_parent parents[8];
-    struct fallback_parent *parent;
-    int num;
-    int err;
-
-    if (len < sizeof(*chan)) {
-        LOGW("%s: radar event too short (%d < %zu), userspace/driver api mismatch?", phy, len, sizeof(*chan));
-        return;
-    }
-
-    chan = data;
-    LOGEM("%s: radar detected, chan %d \n", phy, *chan);
-
-    util_kv_radar_set(phy, *chan);
-    util_cb_delayed_update(UTIL_CB_PHY, phy);
-
-    if (!util_wifi_phy_has_sta(phy)) {
-        LOGD("%s: no sta vif found, skipping parent change", phy);
-        return;
-    }
-
-    fallback_phy = wiphy_info_get_2ghz_ifname();
-    if (!fallback_phy) {
-        LOGW("%s: no phy found for 2.4G", phy);
-        return;
-    }
-
-    if ((num = util_kv_get_fallback_parents(fallback_phy, parents, ARRAY_SIZE(parents))) <= 0) {
-        LOGEM("%s: no fallback parents configured, restarting managers", phy);
-        target_device_restart_managers();
-        return;
-    }
-
-    /* Simplest way, just choose first one */
-    parent = &parents[0];
-
-    LOGI("%s: parentchange.sh %s %s %d", phy, fallback_phy, parent->bssid, parent->channel);
-    err = runcmd("%s/parentchange.sh '%s' '%s' '%d'",
-                 target_bin_dir(),
-                 fallback_phy,
-                 parent->bssid,
-                 parent->channel);
-    if (err) {
-        LOGW("%s: failed to run parentchange.sh '%s' '%s' '%d': %d (%s)",
-             __func__,
-             fallback_phy,
-             parent->bssid,
-             parent->channel,
-             errno,
-             strerror(errno));
-    }
-}
-
-#ifdef EXQCA
-static void
-util_nl_parse_iwevcustom(const char *ifname,
-                         const void *data,
-                         int len)
-{
-    const struct iw_point *iwp;
-
-    iwp = data - IW_EV_POINT_OFF;;
-    data += IW_EV_POINT_LEN - IW_EV_POINT_OFF;
-
-    LOGT("%s: parsing %p, flags=%d length=%d (total=%d)",
-         ifname, data, iwp->flags, iwp->length, len);
-
-    if (iwp->length > len) {
-        LOGD("%s: failed to parse iwevcustom, too long", ifname);
-        return;
-    }
-
-    switch (iwp->flags) {
-        case IEEE80211_EV_CHAN_CHANGE:
-            return util_nl_parse_iwevcustom_chan_change(ifname, data, iwp->length);
-        case IEEE80211_EV_CSA_RX:
-            return util_nl_parse_iwevcustom_csa_rx(ifname, data, iwp->length);
-        case IEEE80211_EV_CHANNEL_LIST_UPDATED:
-            return util_nl_parse_iwevcustom_channel_list_updated(ifname, data, iwp->length);
-        case IEEE80211_EV_RADAR_DETECTED:
-            return util_nl_parse_iwevcustom_radar_detected(ifname, data, iwp->length);
-        case IEEE80211_EV_CAC_STARTED:
-        case IEEE80211_EV_CAC_COMPLETED:
-        case IEEE80211_EV_NOL_STARTED:
-        case IEEE80211_EV_NOL_FINISHED:
-            break;
-        default:
-            LOGT("%s: Unknown event on interface [%s]", __func__, ifname);
-            break;
-    }
-}
-#endif
-
-#ifdef EXQCA
 static void
 util_nl_parse(const void *buf, unsigned int len)
 {
@@ -2939,21 +2405,6 @@ util_nl_parse(const void *buf, unsigned int len)
         if (hdr->nlmsg_type == RTM_NEWLINK ||
             hdr->nlmsg_type == RTM_DELLINK) {
 
-            /* Driver blindly sends all Probe Requests to user space after
-             * enabling WPS. There is no need to rediscover ifaces after
-             * receiving Probe Reqs, therefore we drop them here.
-             *
-             * Probe Requests are sent as IWEVASSOCREQIE events and it looks
-             * that this is the only case when IWEVASSOCREQIE is used.
-             */
-            bool skip_discover = false;
-            util_nl_each_attr_type(hdr, attr, attrlen, IFLA_WIRELESS)
-                util_nl_each_iwe_type(attr, iwe, iwelen, IWEVASSOCREQIE)
-                    skip_discover = true;
-
-            if (skip_discover)
-                continue;
-
             memset(ifname, 0, sizeof(ifname));
 
             util_nl_each_attr_type(hdr, attr, attrlen, IFLA_IFNAME)
@@ -2962,25 +2413,18 @@ util_nl_parse(const void *buf, unsigned int len)
             if (strlen(ifname) == 0)
                 continue;
 
-            qca_ctrl_discover(ifname);
-
-            util_nl_each_attr_type(hdr, attr, attrlen, IFLA_WIRELESS)
-                util_nl_each_iwe_type(attr, iwe, iwelen, IWEVCUSTOM)
-                    util_nl_parse_iwevcustom(ifname,
-                                             util_nl_iwe_data(iwe),
-                                             util_nl_iwe_payload(iwe));
+            hostap_ctrl_discover(ifname);
 
             ifm = NLMSG_DATA(hdr);
             created = (hdr->nlmsg_type == RTM_NEWLINK) && (ifm->ifi_change == ~0U);
             deleted = (hdr->nlmsg_type == RTM_DELLINK);
             if ((created || deleted) &&
-                (access(F("/sys/class/net/%s/parent", ifname), R_OK) == 0))
+                (access(F("/sys/class/net/%s", ifname), R_OK) == 0))
                 util_cb_delayed_update(UTIL_CB_VIF, ifname);
             if (deleted && util_wifi_is_ap_vlan(ifname))
                 util_cb_delayed_update(UTIL_CB_VIF, ifname);
         }
 }
-#endif
 
 static int util_nl_listen_start(void);
 
@@ -3011,9 +2455,8 @@ util_nl_listen_cb(struct ev_loop *loop,
     }
 
     LOGT("%s: received %d bytes", __func__, len);
-#ifdef EXQCA
+
     util_nl_parse(buf, len);
-#endif
 }
 
 static int
@@ -3072,36 +2515,6 @@ util_nl_listen_start(void)
  * Policies for certain actions and options
  *****************************************************************************/
 
-#define POLICY_RTS_THR 1000
-
-static int
-util_policy_get_csa_deauth(const char *vif, const char *freq_band)
-{
-    return 0;
-}
-
-static bool
-util_policy_get_rts(const char *phy,
-                    const char *freq_band)
-{
-    if (util_wifi_phy_is_offload(phy))
-        return false;
-
-    if (strcmp(freq_band, "2.4G"))
-        return false;
-
-    return true;
-}
-
-static bool
-util_policy_get_cwm_enable(const char *phy)
-{
-    /* This prevents chips like Dragonfly from downgrading
-     * to HT20 mode.
-     */
-    return util_wifi_phy_is_offload(phy);
-}
-
 static bool
 util_policy_get_disable_coext(const char *vif)
 {
@@ -3120,21 +2533,12 @@ util_policy_get_csa_interop(const char *vif)
     return strstr(vif, "home-ap-");
 }
 
-static const char *
-util_policy_get_min_hw_mode(const char *vif)
-{
-    if (!strcmp(vif, "home-ap-24"))
-        return "11b";
-    else
-        return "11g"; /* works for both 2.4GHz and 5GHz */
-}
-
 /******************************************************************************
  * Radio utilities
  *****************************************************************************/
 
 static const char *
-util_radio_channel_state(const char *line)
+util_radio_channel_state(const char *line, int channel)
 {
    /* key = channel number, value = { "state": "allowed" }
     * channel states:
@@ -3144,185 +2548,57 @@ util_radio_channel_state(const char *line)
     *     "cac_started" - dfs/CAC started
     *     "cac_completed" - dfs/pass CAC beaconing
     */
+
     if (!strstr(line, " DFS"))
         return"{\"state\":\"allowed\"}";
 
-    if (strstr(line, " DFS_NOP_FINISHED"))
+    /*
+     * DFS_NOP_FINISHED can indicate CAC_STARTED or NOP_FINISHED state
+     * DFS_CAC_COMPLETED indicates CAC_COMPLETED state
+     * DFS_NOP_STARTED indicates NOP_STARTED state (radar detected)
+     */
+    if (strstr(line, " DFS_NOP_FINISHED")) {
+        if (g_chan_status[channel].state == CAC_STARTED)
+            return "{\"state\": \"cac_started\"}";
+        if (g_chan_status[channel].state != NOP_FINISHED)
+            LOGE("%s: DFS channel[%d] state[%d] is out of sync with driver state[DFS_NOP_FINISHED]!",
+                __func__, channel, g_chan_status[channel].state);
         return "{\"state\": \"nop_finished\"}";
-    if (strstr(line, " DFS_NOP_STARTED"))
+    }
+    if (strstr(line, " DFS_NOP_STARTED")) {
+        if (g_chan_status[channel].state != NOP_STARTED)
+            LOGE("%s: DFS channel[%d] state[%d] is out of sync with driver state[DFS_NOP_STARTED]!",
+                __func__, channel, g_chan_status[channel].state);
         return "{\"state\": \"nop_started\"}";
-    if (strstr(line, " DFS_CAC_STARTED"))
-        return "{\"state\": \"cac_started\"}";
-    if (strstr(line, " DFS_CAC_COMPLETED"))
+    }
+    if (strstr(line, " DFS_CAC_COMPLETED")) {
+        if (g_chan_status[channel].state != CAC_COMPLETED)
+            LOGE("%s: DFS channel[%d] state[%d] is out of sync with driver state[DFS_CAC_COMPLETED]!",
+                __func__, channel, g_chan_status[channel].state);
         return "{\"state\": \"cac_completed\"}";
+    }
 
     return "{\"state\": \"nop_started\"}";
-}
-
-static bool
-util_radio_bgcac_active(const char *phy, int chan, const char *ht_mode)
-{
-    const int *channels;
-    const int *chans;
-    const char *line;
-    char *buf;
-    int c;
-    int precac;
-
-    /* Check if driver/hw enable/support precac */
-    if (!util_qca_get_int(phy, "get_preCACEn", &precac))
-        return false;
-    if (precac != 1)
-        return false;
-
-    /* Get current channels */
-    channels = util_get_channels(phy, chan, ht_mode);
-    if (WARN_ON(!channels))
-        return false;
-
-    /* Check if any of current channels have CAC started */
-    if (WARN_ON(!(buf = strexa("exttool", "--interface", phy, "--list"))))
-        return false;
-
-    while ((line = strsep(&buf, "\r\n"))) {
-        if (sscanf(line, "chan %d", &c) != 1)
-            continue;
-        if (!strstr(line, "DFS_CAC_STARTED"))
-            continue;
-
-        chans = channels;
-        while (*chans)
-            if (*chans++ == c)
-                return true;
-    }
-
-    return false;
-}
-
-static void
-util_radio_bgcac_recalc(const char *phy, const struct schema_Wifi_Radio_State *rstate)
-{
-    const int *channels;
-    /*
-     * Today only Cascade support this. When we set
-     * VHT80 check if can run background CAC and if
-     * possible switch HW to VHT80+80, where first
-     * 80MHz stay as our main channel and second
-     * 80MHz block is used for background CAC.
-     * Because of that, we will check only possible
-     * 80MHz DFS channels here.
-     */
-    const int cw_80[] = {60, 108, 124};
-    unsigned int i;
-    const char *state;
-    int channel;
-    int restart;
-    int precac;
-    int j;
-
-    restart = 0;
-
-    /* Check if driver/hw set/enable precac */
-    if (!util_qca_get_int(phy, "get_preCACEn", &precac))
-        return;
-    if (precac != 1)
-        return;
-
-    /* Check if any apvif */
-    if (!util_iwconfig_any_phy_vif_type(phy, "ap", A(32)))
-        return;
-
-    /* Check if channel(s) are CAC ready */
-    for (i = 0; i < ARRAY_SIZE(cw_80); i++) {
-        channels = util_get_channels(phy, cw_80[i], "HT80");
-        if (!channels)
-            continue;
-
-        while (*channels) {
-            channel = 0;
-            state = NULL;
-
-            for (j = 0; j < rstate->channels_len; j++) {
-                channel = atoi(rstate->channels_keys[j]);
-                state = rstate->channels[j];
-                if (*channels != channel)
-                    continue;
-                break;
-            }
-
-            if (*channels++ != channel) {
-                LOGT("%s no channel found %d, skip", phy, channel);
-                restart = 0;
-                break;
-            }
-
-            if (!state)
-                continue;
-
-            /* Check if NOP started on any channel from 80MHz */
-            if (strstr(state, "nop_started")) {
-                LOGT("%s nop started %d, skip", phy, channel);
-                restart = 0;
-                break;
-            }
-
-            /* Count CAC ready channels */
-            if (strstr(state, "nop_finished"))
-                restart++;
-        }
-
-        if (restart)
-            break;
-    }
-
-    if (!restart)
-        return;
-
-    LOGI("%s background CAC restart vdev(s) chan %d @ %s %d",
-         phy, rstate->channel, rstate->ht_mode, restart);
-
-    runcmd("exttool --chanswitch --interface %s --chan %d --numcsa %d --chwidth %d --secoffset %d --force",
-            phy,
-            rstate->channel,
-            CSA_COUNT,
-            util_csa_get_chwidth(phy, rstate->ht_mode),
-            util_csa_get_secoffset(phy, rstate->channel));
 }
 
 static void
 util_radio_channel_list_get(const char *phy, struct schema_Wifi_Radio_State *rstate)
 {
-    char buffer[4096];
-    char *buf;
-    char *line;
-    int err;
-    int channel;
+    char    *line;
+    int     channel;
+    char    buffer[BFR_SIZE_4K] = "";
+    char    *buf = buffer;
 
-    buf = buffer;
-
-    err = readcmd(buffer, sizeof(buffer), 0, "exttool --interface %s --list", phy);
-    if (err) {
-        LOGW("%s: readcmd() failed: %d (%s)", phy, errno, strerror(errno));
-        return;
-    }
+    if (nl_req_get_channels(phy, buffer, sizeof(buffer)) < 0)
+        LOGW("%s: failed to fetch channel information", __func__);
 
     while ((line = strsep(&buf, "\n")) != NULL) {
         LOGD("%s line: |%s|", phy, line);
         if (sscanf(line, "chan %d", &channel) == 1) {
             rstate->allowed_channels[rstate->allowed_channels_len++] = channel;
-            SCHEMA_KEY_VAL_APPEND(rstate->channels, F("%d", channel), util_radio_channel_state(line));
+            SCHEMA_KEY_VAL_APPEND(rstate->channels, F("%d", channel), util_radio_channel_state(line, channel));
         }
     }
-
-    /*
-     * We put background CAC recalc here to cover case
-     * when channels back to CAC ready (nop_finished)
-     * after NOP period finished.
-     * This is also called when we update Config::zero_wait_dfs
-     * from upper layer (WM2). So, use this place as a single
-     * recalculation point.
-     */
-    util_radio_bgcac_recalc(phy, rstate);
 }
 
 static void
@@ -3378,61 +2654,14 @@ util_radio_ht_mode_get_max(const char *phy,
 static bool
 util_radio_ht_mode_get(char *phy, char *htmode, int htmode_len)
 {
-    char vifs[512];
-    char *vifr = vifs;
-    char *vif;
+    char ap_vif[BFR_SIZE_64] = "";
 
-#if 0
-    // TODO: Need to be reviewed
-    const struct util_iwpriv_mode *mode;
-    char ht_mode_vif[32];
-    memset(ht_mode_vif, '\0', sizeof(ht_mode_vif));
-
-    if (util_wifi_get_phy_vifs(phy, vifs, sizeof(vifs))) {
-        LOGE("%s: get vifs failed", phy);
+    if (util_wifi_get_phy_any_ap_vif(phy, ap_vif, sizeof(ap_vif))) {
+        LOGE("%s: get ap vif failed", phy);
         return false;
     }
 
-    while ((vif = strsep(&vifr, " "))) {
-        if (strlen(vif)) {
-            if (strstr(vif, "bhaul-sta") == NULL) {
-                if (util_qca_get_ht_mode(vif, htmode, htmode_len)) {
-                    if (strlen(ht_mode_vif) == 0) {
-                        STRSCPY(ht_mode_vif, htmode);
-                    }
-                    else if ((strcmp(ht_mode_vif, htmode)) != 0) {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    if (strlen(htmode) == 0) {
-        if (util_radio_ht_mode_get_max(phy, ht_mode_vif, sizeof(ht_mode_vif))) {
-            snprintf(htmode, htmode_len, "HT%s", ht_mode_vif);
-            return true;
-        }
-    }
-
-    /* This handles 11B, 11G and 11A cases implicitly: */
-    mode = util_qca_lookup_mode(htmode);
-    if (!mode)
-        return false;
-
-    strscpy(htmode, mode->htmode, htmode_len);
-    return true;
-#endif
-
-    if (util_wifi_get_phy_all_vifs(phy, vifs, sizeof(vifs))) {
-        LOGE("%s: get vifs failed", phy);
-        return false;
-    }
-    while ((vif = strsep(&vifr, " ")))
-        if (strlen(vif))
-            if (strstr(vif, "bhaul-ap") || strstr(vif, "home_ap"))
-                return util_qca_get_ht_mode(vif, htmode, htmode_len);
-
-    return false;
+    return util_get_ht_mode(ap_vif, htmode, htmode_len);
 }
 
 static bool
@@ -3508,7 +2737,7 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
     if ((rstate->channel_exists = util_get_phy_chan(phy, &v)))
         rstate->channel = v;
 
-    if ((rstate->bcn_int_exists = util_qca_get_bcn_int(phy, &v)))
+    if ((rstate->bcn_int_exists = util_get_bcn_int(phy, &v)))
         rstate->bcn_int = v;
 
     if ((rstate->ht_mode_exists = util_radio_ht_mode_get(phy, htmode, sizeof(htmode))))
@@ -3531,13 +2760,13 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
 
     n = 0;
 
-    if (util_qca_get_int(phy, "getCountryID", &v)) {
+    if (util_get_int(phy, "getCountryID", &v)) {
         STRSCPY(rstate->hw_params_keys[n], "country_id");
         snprintf(rstate->hw_params[n], sizeof(rstate->hw_params[n]), "%d", v);
         n++;
     }
 
-    if (util_qca_get_int(phy, "getRegdomain", &v)) {
+    if (util_get_int(phy, "getRegdomain", &v)) {
         STRSCPY(rstate->hw_params_keys[n], "reg_domain");
         snprintf(rstate->hw_params[n], sizeof(rstate->hw_params[n]), "%d", v);
         n++;
@@ -3552,7 +2781,7 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
             extbusythres = -1;
             for (d = readdir(dirp); d; d = readdir(dirp)) {
                 if (util_wifi_is_phy_vif_match(phy, d->d_name)) {
-                    if (!util_qca_get_int(d->d_name, "g_extbusythres", &v))
+                    if (!util_get_int(d->d_name, "g_extbusythres", &v))
                         continue;
                     if (extbusythres == -1)
                         extbusythres = v;
@@ -3572,60 +2801,11 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
         }
     }
 
-    if ((kv = util_kv_get(F("%s.dfs_usenol", phy)))) {
-#if 0
-        WARN(-1 == util_exec_read(rtrimws, buf, sizeof(buf),
-                                  "radartool", "-i", phy),
-             "%s: failed to read radartool status: %d (%s)",
-             phy, errno, strerror(errno));
+    // hw_config, hw_config_keys, hw_config_len is not supported
+    // rstate->thermal_shutdown should be taken care by the OEMs
 
-        if (strstr(buf, "No Channel Switch announcement"))
-            v = 2;
-        else if (strstr(buf, "Use NOL: yes"))
-            v = 1;
-        else if (strstr(buf, "Use NOL: no"))
-            v = 0;
-        else
-            v = -1;
-#else
-            v = 1;
-#endif
-        if (v >= 0) {
-            STRSCPY(rstate->hw_config_keys[n], "dfs_usenol");
-            snprintf(rstate->hw_config[n], sizeof(rstate->hw_config[n]), "%d", v);
-            n++;
-        }
-    }
-
-    if ((kv = util_kv_get(F("%s.dfs_enable", phy)))) {
-        STRSCPY(rstate->hw_config_keys[n], "dfs_enable");
-        STRSCPY(rstate->hw_config[n], kv->val);
-        n++;
-    }
-
-    if ((kv = util_kv_get(F("%s.dfs_ignorecac", phy)))) {
-        STRSCPY(rstate->hw_config_keys[n], "dfs_ignorecac");
-        STRSCPY(rstate->hw_config[n], kv->val);
-        n++;
-    }
-
-    rstate->hw_config_len = n;
-
-#if 0
-    /*
-     * If the issue is seen this should be taken care by the OEMs
-     */
-    if (strlen(vif) > 0 &&
-        (rstate->thermal_shutdown_exists = util_qca_get_int(vif,
-                                                               "get_therm_shut",
-                                                               &v)
-                                           && v >= 0)) {
-        rstate->thermal_shutdown = v;
-    }
-#endif
-
-    type = util_thermal_get_qca_names(phy);
-    if ((rstate->tx_chainmask_exists = util_qca_get_int(phy, type[0], &v) && v > 0))
+    type = util_thermal_get_names(phy);
+    if ((rstate->tx_chainmask_exists = util_get_int(phy, type[0], &v) && v > 0))
         rstate->tx_chainmask = v;
 
     t = util_thermal_lookup(phy);
@@ -3642,11 +2822,11 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
     if ((rstate->thermal_downgraded_exists = t && t->period_sec > 0))
         rstate->thermal_downgraded = util_thermal_phy_is_downgraded(t);
 
-    if ((rstate->tx_power = util_iwconfig_get_tx_power(phy)) > 0)
+    if ((rstate->tx_power = util_get_tx_power(phy)) > 0)
         rstate->tx_power_exists = true;
 
     if ((kv = util_kv_get(F("%s.zero_wait_dfs", phy))) && strlen(kv->val)) {
-        if (!strcmp(kv->val, "precac") && util_qca_get_int(phy, "get_preCACEn", &v) && v == 1)
+        if (!strcmp(kv->val, "precac") && util_get_int(phy, "get_preCACEn", &v) && v == 1)
             SCHEMA_SET_STR(rstate->zero_wait_dfs, kv->val);
         if (!strcmp(kv->val, "disable"))
             SCHEMA_SET_STR(rstate->zero_wait_dfs, kv->val);
@@ -3662,92 +2842,75 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
 void
 util_hw_config_set(const struct schema_Wifi_Radio_Config *rconf)
 {
-    const struct dirent *d;
-    const char *phy = rconf->if_name;
-    const char *p;
-    DIR *dir;
-
-    if (strlen(p = SCHEMA_KEY_VAL(rconf->hw_config, "cwm_extbusythres")) > 0)
-        if ((dir = opendir("/sys/class/net"))) {
-            for (d = readdir(dir); d; d = readdir(dir))
-                if (util_wifi_is_phy_vif_match(phy, d->d_name))
-                    WARN(-1 == util_qca_set_int_lazy(d->d_name,
-                                                        "g_extbusythres",
-                                                        "extbusythres",
-                                                        atoi(p)),
-                         "%s@%s: failed to set '%s' = %d: %d (%s)",
-                         d->d_name, phy, "cwm_extbusythres", atoi(p), errno, strerror(errno));
-            closedir(dir);
-    }
-    util_kv_set(F("%s.cwm_extbusythres", phy), strlen(p) ? p : NULL);
-
-    if (strlen(p = SCHEMA_KEY_VAL(rconf->hw_config, "dfs_usenol")) > 0) {
-        LOGI("%s: setting '%s' = '%s'", phy, "dfs_usenol", p);
-        WARN(0 != E("radartool", "-i", phy, "usenol", p),
-             "%s: failed to set radartool '%s': %d (%s)",
-             phy, "dfs_usenol", errno, strerror(errno));
-    }
-    util_kv_set(F("%s.dfs_usenol", phy), strlen(p) ? p : NULL);
-
-    if (strlen(p = SCHEMA_KEY_VAL(rconf->hw_config, "dfs_enable")) > 0) {
-        LOGI("%s: setting '%s' = '%s'", phy, "dfs_enable", p);
-        WARN(0 != E("radartool", "-i", phy, "enable", p),
-             "%s: failed to set radartool '%s': %d (%s)",
-             phy, "dfs_enable", errno, strerror(errno));
-    }
-    util_kv_set(F("%s.dfs_enable", phy), strlen(p) ? p : NULL);
-
-    if (strlen(p = SCHEMA_KEY_VAL(rconf->hw_config, "dfs_ignorecac")) > 0) {
-        LOGI("%s: setting '%s' = '%s'", phy, "dfs_ignorecac", p);
-        WARN(0 != E("radartool", "-i", phy, "ignorecac", p),
-             "%s: failed to set radartool '%s': %d (%s)",
-             phy, "dfs_ignorecac", errno, strerror(errno));
-    }
-    util_kv_set(F("%s.dfs_ignorecac", phy), strlen(p) ? p : NULL);
+    LOGT("%s: hw_config is not supported", __func__);
 }
 
-static bool
-util_radio_config_only_channel_changed(const struct schema_Wifi_Radio_Config_flags *changed)
+int hapd_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char *phy, const char *vif)
 {
-    struct schema_Wifi_Radio_Config_flags a;
-    struct schema_Wifi_Radio_Config_flags b;
+    int     width;
+    bool    status;
+    char    mode[BFR_SIZE_32] = "";
+    char    opt_chan_info[BFR_SIZE_64] = "";
+    int     sec_chan_offset;
+    char    sec_chan_offset_str[BFR_SIZE_64] = "";
+    int     center_chan;
+    int     center_freq1;
+    char    center_freq1_str[BFR_SIZE_64] = "";
+    char    hostapd_cmd[BFR_SIZE_1K] = "";
+    char    curr_htmode[BFR_SIZE_32] = "";
+    int     curr_chan = 0;
 
-    memcpy(&a, changed, sizeof(a));
-    memset(&b, 0, sizeof(b));
-    a.channel = false;
-    a.ht_mode = false;
+    if (!rconf->channel_exists || !rconf->ht_mode_exists)
+        return -1;
 
-    return !memcmp(&a, &b, sizeof(a));
-}
+    if (util_get_phy_chan(rconf->if_name, &curr_chan)
+        && util_radio_ht_mode_get(rconf->if_name, curr_htmode, sizeof(curr_htmode))) {
+        if ((rconf->channel == curr_chan) && (!strcmp(curr_htmode, rconf->ht_mode))) {
+            LOGN("%s: already in newly requested channel and htmode", __func__);
+            return 0;
+        }
+    }
 
-void
-util_mode_reconfig(
-        const char *vif,
-        const char *hw_mode,
-        const char *freq_band,
-        const char *ht_mode)
-{
-    const struct util_iwpriv_mode *mode;
-    char oldmode[32];
-    char newmode[32];
-    int err;
+    if (g_chan_status[rconf->channel].state == CAC_STARTED) {
+        LOGN("%s: cac in progress on channel %d", __func__, rconf->channel);
+        return -1;
+    }
 
-    if (WARN_ON(!qca_get_ht_mode(vif, oldmode, sizeof(oldmode))))
-        return;
+    sec_chan_offset = get_sec_chan_offset(rconf);
+    if (sec_chan_offset != -EINVAL)
+        snprintf(sec_chan_offset_str, sizeof(sec_chan_offset_str), "sec_channel_offset=%d", sec_chan_offset);
 
-    mode = util_qca_lookup_mode(oldmode);
-    if (WARN_ON(!mode))
-        return;
+    ht_mode_to_mode(rconf, mode, sizeof(mode));
 
-    if (!strcmp(mode->hwmode, hw_mode))
-        return;
+    if (!ht_mode_to_bw(rconf, &width))
+        snprintf(opt_chan_info, sizeof(opt_chan_info), "bandwidth=%d %s", width, mode);
 
-    err = util_qca_get_mode(hw_mode, ht_mode, freq_band, newmode, sizeof(newmode));
-    if (WARN_ON(err < 0))
-        return;
+    if ((width > 20) || (!strcmp(mode, "vht"))) {
+        if ((center_chan = unii_5g_centerfreq(rconf->ht_mode, rconf->channel)) > 0) {
+            center_freq1 = util_chan_to_freq(center_chan);
+            if (center_freq1)
+                snprintf(center_freq1_str, sizeof(center_freq1_str), "center_freq1=%d", center_freq1);
+        }
+    }
 
-    LOGI("%s: syncing mode %s -> %s", vif, oldmode, newmode);
-    util_qca_set_str_lazy(vif, "get_mode", "mode", newmode);
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s CHAN_SWITCH %d %d %s %s %s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
+            CHAN_SWITCH_DEFAULT_CS_COUNT,
+            util_chan_to_freq(rconf->channel),
+            strlen(center_freq1_str) ? center_freq1_str : "",
+            strlen(sec_chan_offset_str) ? sec_chan_offset_str : "",
+            strlen(opt_chan_info) ? opt_chan_info : "");
+
+    LOGI("%s: %s", __func__, hostapd_cmd);
+
+    status = !cmd_log(hostapd_cmd);
+    if (!status) {
+        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
+        return -1;
+    }
+
+    return 0;
 }
 
 bool
@@ -3759,48 +2922,26 @@ target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
     if ((changed->channel || changed->ht_mode)) {
         if (rconf->channel_exists && rconf->channel > 0 && rconf->ht_mode_exists) {
-            if ((vif = util_iwconfig_any_phy_vif_type(phy, "ap", A(32)))) {
-                if (util_radio_bgcac_active(phy, rconf->channel, rconf->ht_mode)) {
-                    LOGI("%s: background CAC active %d @ %s postpone channel change", phy, rconf->channel, rconf->ht_mode);
-                } else {
-                    LOGI("%s: starting csa to %d @ %s", phy, rconf->channel, rconf->ht_mode);
-                    /*
-                     * Set mode in 2.4GHz using iwpriv before VAP is up does not work in SPF11.1 CS
-                     * Workaround is to update the mode for 2.4GHz AP vap
-                     * This can be removed if the issue is fixed in default SPF
-                     */
-                    util_mode_reconfig(vif, rconf->hw_mode, rconf->freq_band, rconf->ht_mode);
-                    if (util_csa_start(phy, vif, rconf->hw_mode, rconf->freq_band, rconf->ht_mode, rconf->channel))
-                        LOGW("%s: failed to start csa: %d (%s)", phy, errno, strerror(errno));
-                    else if (util_radio_config_only_channel_changed(changed))
-                        goto report;
-                }
-             } else {
+            if ((vif = util_any_phy_vif_type(phy, "ap", A(32)))) {
+                if (hapd_channel_switch(rconf, phy, vif) < 0)
+                    LOGN("%s: error received while trying to set new channel/ht_mode", __func__);
+            } else {
                 LOGI("%s: no ap vaps, channel %d will be set on first vap if possible",
-                     phy, rconf->channel);
+                    phy, rconf->channel);
             }
         }
     }
 
-    if ((vif = util_iwconfig_any_phy_vif_type(phy, NULL, A(32)))) {
-#if 0
-        /*
-         * If the issue is seen this should be taken care by the OEMs
-         */
-        if (changed->thermal_shutdown) {
-            if (-1 == util_qca_set_int_lazy(vif, "get_therm_shut", "therm_shutdown", rconf->thermal_shutdown))
-                LOGW("%s: failed to set thermal_shutdown to %d: %d (%s)",
-                     vif, rconf->thermal_shutdown, errno, strerror(errno));
-        }
-#endif
+    if ((vif = util_any_phy_vif_type(phy, NULL, A(32)))) {
+        // changed->thermal_shutdown should be taken care by the OEMs
         if (changed->bcn_int) {
-            if (-1 == util_qca_set_int_lazy(vif, "get_bintval", "bintval", rconf->bcn_int))
+            if (-1 == util_set_int_lazy(vif, "get_bintval", "bintval", rconf->bcn_int))
                 LOGW("%s: failed to set bcn_int to %d: %d (%s)",
-                     vif, rconf->bcn_int, errno, strerror(errno));
+                    vif, rconf->bcn_int, errno, strerror(errno));
         }
     }
 
-    util_qca_set_int_lazy(phy, "get_dbdc_enable", "dbdc_enable", 0);
+    util_set_int_lazy(phy, "get_dbdc_enable", "dbdc_enable", 0);
 
     if (changed->thermal_integration ||
         changed->thermal_downgrade_temp ||
@@ -3815,19 +2956,19 @@ target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
         util_radio_fallback_parents_set(phy, rconf);
 
     if (changed->tx_power)
-        util_iwconfig_set_tx_power(phy, rconf->tx_power);
+        util_set_tx_power(phy, rconf->tx_power);
 
     if (changed->zero_wait_dfs) {
         if (!strcmp(rconf->zero_wait_dfs, "precac")) {
-            util_qca_set_int_lazy(phy, "get_preCACEn", "preCACEn", 1);
+            util_set_int_lazy(phy, "get_preCACEn", "preCACEn", 1);
             util_kv_set(F("%s.zero_wait_dfs", phy), rconf->zero_wait_dfs);
         } else if (!strcmp(rconf->zero_wait_dfs, "disable")) {
-            util_qca_set_int_lazy(phy, "get_preCACEn", "preCACEn", 0);
+            util_set_int_lazy(phy, "get_preCACEn", "preCACEn", 0);
             util_kv_set(F("%s.zero_wait_dfs", phy), rconf->zero_wait_dfs);
         } else {
             /* Today we don't support enable mode */
             WARN_ON(strcmp(rconf->zero_wait_dfs, "enable") == 0);
-            util_qca_set_int_lazy(phy, "get_preCACEn", "preCACEn", 0);
+            util_set_int_lazy(phy, "get_preCACEn", "preCACEn", 0);
             util_kv_set(F("%s.zero_wait_dfs", phy), NULL);
         }
     }
@@ -3860,198 +3001,6 @@ util_vif_get_vconf_maclist(const struct schema_Wifi_VIF_Config *vconf,
     return buf;
 }
 
-struct vif_ratepair {
-    const char *get;
-    const char *set;
-    int value;
-};
-
-static const struct vif_ratepair g_util_vif_11b_rates[] = {
-    { "g_dis_legacy", "dis_legacy", 0 },
-    { "get_bcast_rate", "bcast_rate", 1000 },
-    { "get_mcast_rate", "mcast_rate", 1000 },
-    { "get_bcn_rate", "set_bcn_rate", 1000 },
-    { "g_mgmt_rate", "mgmt_rate", 1000 },
-    { 0, 0, 0 },
-};
-
-static const struct vif_ratepair g_util_vif_11g_rates[] = {
-    { "g_dis_legacy", "dis_legacy", 15 },
-    { "get_bcast_rate", "bcast_rate", 12000 },
-    { "get_mcast_rate", "mcast_rate", 12000 },
-    { "get_bcn_rate", "set_bcn_rate", 6000 },
-    { "g_mgmt_rate", "mgmt_rate", 6000 },
-    { 0, 0, 0 },
-};
-
-static const struct vif_ratepair g_util_vif_11a_rates[] = {
-    { "g_dis_legacy", "dis_legacy", 0 },
-    { "get_bcast_rate", "bcast_rate", 12000 },
-    { "get_mcast_rate", "mcast_rate", 12000 },
-    { "get_bcn_rate", "set_bcn_rate", 6000 },
-    { "g_mgmt_rate", "mgmt_rate", 6000 },
-    { 0, 0, 0 },
-};
-
-static bool
-util_vif_ratepair_is_set(const char *vif, const struct vif_ratepair *r)
-{
-    int i;
-    int v;
-
-    for (i = 0; r[i].get; i++) {
-        if (!util_qca_get_int(vif, r[i].get, &v))
-            return false;
-        if (v != r[i].value)
-            return false;
-    }
-
-    return true;
-}
-
-static void
-util_vif_ratepair_war(const char *vif)
-{
-    struct hapd *hapd = hapd_lookup(vif);
-    char opmode[32];
-    char phy[32];
-    char *p;
-    int err;
-    int mac_cmd, hide_ssid;
-
-    if (!util_iwconfig_get_opmode(vif, opmode, sizeof(opmode)))
-        return;
-    if (strcmp(opmode, "ap"))
-        return;
-    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
-        return;
-    if (hapd && hapd->ctrl.wpa)
-        return;
-
-    LOGI("%s: forcing phy mode update", vif);
-
-    util_qca_get_int(vif, "get_maccmd", &mac_cmd);
-    util_qca_get_int(vif, "get_hide_ssid", &hide_ssid);
-    util_qca_set_int(vif, "maccmd", 1);
-    util_qca_set_int(vif, "hide_ssid", 1);
-
-    p = F("i=%s ; "
-        "iwconfig $i essid dummy ;"
-        "ifconfig $i up ;"
-        "ifconfig $i down ;"
-        "",
-        vif);
-
-    util_qca_set_int(vif, "maccmd", mac_cmd);
-    util_qca_set_int(vif, "hide_ssid", hide_ssid);
-
-    if ((err = system(p)))
-        LOGW("%s: failed to apply min_hw_mode workaround: %d", vif, err);
-}
-
-static bool
-util_vif_ratepair_set(const char *vif, const struct vif_ratepair *r)
-{
-    int i;
-
-    util_vif_ratepair_war(vif);
-
-    for (i = 0; r[i].get; i++)
-        if (util_qca_set_int_lazy(vif, r[i].get, r[i].set, r[i].value))
-            LOGW("%s: failed to set '%s' = %d: %d (%s)",
-                 vif, r[i].set, r[i].value, errno, strerror(errno));
-
-    return util_vif_ratepair_is_set(vif, r);
-}
-
-static const char *
-util_vif_min_hw_mode_get(const char *vif)
-{
-    char phy[32];
-    int pure11ac;
-    int pure11n;
-    int pure11g;
-    int rate11g = 0;
-    int rate11a = 0;
-    int rate11b = 0;
-    int is2ghz;
-
-    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
-        return NULL;
-
-    if (!util_qca_get_int(vif, "get_pureg", &pure11g))
-        LOGW("%s: failed to get pureg: %d (%s)", vif, errno, strerror(errno));
-    if (!util_qca_get_int(vif, "get_puren", &pure11n))
-        LOGW("%s: failed to get puren: %d (%s)", vif, errno, strerror(errno));
-    if (!util_qca_get_int(vif, "get_pure11ac", &pure11ac))
-        LOGW("%s: failed to get pure11ac: %d (%s)", vif, errno, strerror(errno));
-
-    if ((is2ghz = util_wifi_phy_is_2ghz(phy))) {
-        if ((rate11g = util_vif_ratepair_is_set(vif, g_util_vif_11g_rates))) {
-            if (pure11n)
-                return "11n";
-            if (pure11g)
-                return "11g";
-        }
-        if ((rate11b = util_vif_ratepair_is_set(vif, g_util_vif_11b_rates))) {
-            if (!pure11ac && !pure11n && !pure11g)
-                return "11b";
-        }
-    } else {
-        if ((rate11a = util_vif_ratepair_is_set(vif, g_util_vif_11a_rates))) {
-            if (pure11ac)
-                return "11ac";
-            if (pure11n)
-                return "11n";
-            return "11a";
-        }
-    }
-
-    LOGW("%s: is running in unexpected min_hw_mode:"
-         " is2ghz=%d pure11ac=%d pure11n=%d pure11g=%d rate11g=%d rate11a=%d rate11b=%d",
-         vif, is2ghz, pure11ac, pure11n, pure11g, rate11g, rate11a, rate11b);
-    return NULL;
-}
-
-static void
-util_vif_min_hw_mode_set(const char *vif, const char *mode)
-{
-    char phy[32];
-    int pure11ac;
-    int pure11n;
-    int pure11g;
-
-    LOGI("%s: setting min hw mode to %s", vif, mode);
-
-    if (util_wifi_get_parent(vif, phy, sizeof(phy)))
-        return;
-
-    pure11ac = !strcmp(mode, "11ac");
-    pure11n = !strcmp(mode, "11n");
-    pure11g = !strcmp(mode, "11g") || !strcmp(mode, "11a");
-
-    if (strcmp(mode, "11b")) {
-        if (util_wifi_phy_is_2ghz(phy)) {
-            if (!util_vif_ratepair_set(vif, g_util_vif_11g_rates))
-                LOGW("%s: failed to enable 11g rates: %d (%s)", vif, errno, strerror(errno));
-        } else {
-            if (!util_vif_ratepair_set(vif, g_util_vif_11a_rates))
-                LOGW("%s: failed to enable 11a rates: %d (%s)", vif, errno, strerror(errno));
-        }
-    }
-
-    if (util_qca_set_int_lazy(vif, "get_pure11ac", "pure11ac", pure11ac))
-        LOGW("%s: failed to set pure11ac: %d (%s)", vif, errno, strerror(errno));
-    if (util_qca_set_int_lazy(vif, "get_puren", "puren", pure11n))
-        LOGW("%s: failed to set pure11n: %d (%s)", vif, errno, strerror(errno));
-    if (util_qca_set_int_lazy(vif, "get_pureg", "pureg", pure11g))
-        LOGW("%s: failed to set pure11g: %d (%s)", vif, errno, strerror(errno));
-
-    if (!strcmp(mode, "11b"))
-        if (!util_vif_ratepair_set(vif, g_util_vif_11b_rates))
-            LOGW("%s: failed to enable 11b rates: %d (%s)", vif, errno, strerror(errno));
-}
-
 static void
 util_vif_config_athnewind(const char *phy)
 {
@@ -4065,22 +3014,17 @@ util_vif_config_athnewind(const char *phy)
         return;
     p = vifs;
     while ((vif = strsep(&p, " ")) && ++n)
-        if (util_iwconfig_get_opmode(vif, opmode, sizeof(opmode)))
+        if (util_get_opmode(vif, opmode, sizeof(opmode)))
             if (!strcmp(opmode, "ap"))
                 v = 1;
     /* vifs points to null-terminated first vif name, see strsep() above */
     if (strlen(vifs))
-        util_qca_set_int_lazy(vifs, "get_athnewind", "athnewind", v);
+        util_set_int_lazy(vifs, "get_athnewind", "athnewind", v);
 }
 
 /******************************************************************************
  * Vif implementation
  *****************************************************************************/
-
-bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
-{
-    return false;
-}
 
 bool
 target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
@@ -4103,7 +3047,7 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
         changed->enabled ||
         changed->mode ||
         changed->vif_radio_idx) {
-        qca_ctrl_destroy(vif);
+        hostap_ctrl_destroy(vif);
 
         if (access(F("/sys/class/net/%s", vif), X_OK) == 0) {
             LOGI("%s: deleting netdev", vif);
@@ -4128,169 +3072,92 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 
         nl_req_add_iface(vif, phy, vconf->mode, macaddr);
 
-        qca_ctrl_discover(vif);
-
-        if (!strcmp("ap", vconf->mode)) {
-#if 0
-            nl_req_set_iface_chan(phy, rconf->channel);
-#endif
-            LOGI("%s: setting channel %d", vif, rconf->channel);
-            if (E("iwconfig", vif, "channel", F("%d", rconf->channel)))
-                LOGW("%s: failed to set channel %d: %d (%s)",
-                     vif, rconf->channel, errno, strerror(errno));
-
-            if (strstr(rconf->freq_band, "5G") && util_qca_get_int(vif, "get_dfsdomain", &v) && v == 0) {
-                LOGI("%s: we need to restore dfs domain", phy);
-                WARN_ON(util_exec_simple("cfg80211tool.1", "-i", phy, "-h", "none", "--START_CMD", "--setCountry",
-                                        "--RESPONSE", "--setCountry", "--END_CMD"));
-                if (!util_qca_get_int(vif, "get_dfsdomain", &v) || v == 0) {
-                    LOGW("%s: dfs domain restore failed", phy);
-#if 0
-                    return false;
-#endif
-                }
-                LOGI("%s: dfs domain restored correctly to %d", phy, v);
-            }
-        }
+        hostap_ctrl_discover(vif);
 
         if (strstr(rconf->freq_band, "5G") && util_wifi_get_phy_vifs_cnt(phy) == 1) {
             LOGI("%s: we need to restore NOL", phy);
-//            WARN_ON(runcmd("%s/nol.sh restore", target_bin_dir()));
+            //WARN_ON(runcmd("%s/nol.sh restore", target_bin_dir()));
         }
 
-        if (util_policy_get_rts(phy, rconf->freq_band)) {
-            LOGI("%s: setting rts = %d", vif, POLICY_RTS_THR);
-            if (E("iwconfig", vif, "rts", F("%d", POLICY_RTS_THR)))
-                LOGW("%s: failed to set rts %d: %d (%s)",
-                     vif, POLICY_RTS_THR, errno, strerror(errno));
-        }
-
-        util_qca_set_str_lazy(vif, "getdbgLVL", "dbgLVL", "0x0");
-        util_qca_set_int_lazy(vif, "get_powersave", "powersave", 0);
-        util_qca_set_int_lazy(vif, "get_shortgi", "shortgi", 1);
-        util_qca_set_int_lazy(vif, "get_doth", "doth", 1);
-        util_qca_set_int_lazy(vif, "get_csa2g", "csa2g", 1);
-        util_qca_set_int_lazy(vif,
-                                 "get_cwmenable",
-                                 "cwmenable",
-                                 util_policy_get_cwm_enable(phy));
-        if (util_iwconfig_any_phy_vif_type(phy, "sta", A(32)) == NULL) {
-            util_qca_set_int_lazy(vif,
+        util_set_str_lazy(vif, "getdbgLVL", "dbgLVL", "0x0");
+        util_set_int_lazy(vif, "get_powersave", "powersave", 0);
+        util_set_int_lazy(vif, "get_shortgi", "shortgi", 1);
+        util_set_int_lazy(vif, "get_doth", "doth", 1);
+        util_set_int_lazy(vif, "get_csa2g", "csa2g", 1);
+        if (util_any_phy_vif_type(phy, "sta", A(32)) == NULL) {
+            util_set_int_lazy(vif,
                                  "g_disablecoext",
                                  "disablecoext",
                                  util_policy_get_disable_coext(vif));
         }
 
-        /*
-         * The `iwpriv' command has been replaced with `wifitool'.
-         */
-#if 0
-//TODO
-        err = readcmd(buf, sizeof(buf), 0, "wifitool %s g_csa_deauth", vif);
-        if (err) {
-            LOGW("%s: readcmd() failed: %d (%s)", vif, errno, strerror(errno));
-            return false;
-        }
-#endif
-        o = (NULL != strstr(buf, "disabled")) ? 0 : 1;
-        v = util_policy_get_csa_deauth(vif, rconf->freq_band);
-        if (v != o) {
-            memset(buf, 0, sizeof(buf));
-            snprintf(buf, sizeof(buf), "wifitool %s csa_deauth %d", vif, v);
-            err = !cmd_log(buf);
-            if (!err) {
-                LOGE("wifitool csa_deauth execution failed: %s", buf);
-            }
-        }
-
         if (util_policy_get_csa_interop(vif)) {
-            util_qca_set_int_lazy(vif, "gcsainteropphy", "scsainteropphy", 1);
-            util_qca_set_int_lazy(vif, "gcsainteropauth", "scsainteropauth", 1);
-#if 0
-            /*
-             * The issue specific to "*csainteropaggr" command is fixed in
-             * the driver so this code is not required.
-             */
-            util_qca_set_int_lazy(vif, "gcsainteropaggr", "scsainteropaggr", 1);
-#endif
+            util_set_int_lazy(vif, "gcsainteropphy", "scsainteropphy", 1);
+            util_set_int_lazy(vif, "gcsainteropauth", "scsainteropauth", 1);
         }
 
         if ((p = SCHEMA_KEY_VAL(rconf->hw_config, "cwm_extbusythres")))
-            util_qca_set_int_lazy(vif,
+            util_set_int_lazy(vif,
                                      "g_extbusythres",
                                      "extbusythres",
                                      atoi(p));
 
         if (rconf->bcn_int_exists)
-            util_qca_set_int_lazy(vif,
+            util_set_int_lazy(vif,
                                      "get_bintval",
                                      "bintval",
                                      rconf->bcn_int);
 
-#if 0
         /*
          * If the issue is seen this should be taken care by the OEMs
          */
-        if (rconf->thermal_shutdown_exists)
-            util_qca_set_int_lazy(vif,
-                                     "get_therm_shut",
-                                     "therm_shutdown",
-                                     rconf->thermal_shutdown);
-#endif
+        //if (rconf->thermal_shutdown_exists)
+        //    util_set_int_lazy(vif, "get_therm_shut", "therm_shutdown", rconf->thermal_shutdown);
+
         if (rconf->hw_mode_exists &&
             rconf->ht_mode_exists &&
-            0 == util_qca_get_mode(rconf->hw_mode,
+            0 == util_get_mode(rconf->hw_mode,
                                       rconf->ht_mode,
                                       rconf->freq_band,
                                       mode,
                                       sizeof(mode)))
-            util_qca_set_str_lazy(vif, "get_mode", "mode", mode);
+            util_set_str_lazy(vif, "get_mode", "mode", mode);
 
-        if (!strcmp(vconf->mode, "ap"))
-            if (!vconf->min_hw_mode_exists)
-                if ((p = util_policy_get_min_hw_mode(vif)))
-                    util_vif_min_hw_mode_set(vif, p);
+        // vconf->min_hw_mode is not supported
     }
 
     if (vconf->ssid_broadcast_exists)
-        util_qca_set_int_lazy(vif, "get_hide_ssid", "hide_ssid",
+        util_set_int_lazy(vif, "get_hide_ssid", "hide_ssid",
                                  !strcmp("enabled", D(vconf->ssid_broadcast, "enabled")) ? 0 : 1);
 
     if (changed->dynamic_beacon)
-        util_qca_set_int_lazy(vif, "g_dynamicbeacon", "dynamicbeacon", D(vconf->dynamic_beacon, 0));
+        util_set_int_lazy(vif, "g_dynamicbeacon", "dynamicbeacon", D(vconf->dynamic_beacon, 0));
 
     if (changed->mcast2ucast)
-        util_qca_set_int_lazy(vif, "g_mcastenhance", "mcastenhance", D(vconf->mcast2ucast, 0) ? 2 : 0);
+        util_set_int_lazy(vif, "g_mcastenhance", "mcastenhance", D(vconf->mcast2ucast, 0) ? 2 : 0);
 
     if (changed->ap_bridge)
-        util_qca_set_int_lazy(vif, "get_ap_bridge", "ap_bridge", D(vconf->ap_bridge, 0));
+        util_set_int_lazy(vif, "get_ap_bridge", "ap_bridge", D(vconf->ap_bridge, 0));
 
     if (changed->vif_dbg_lvl)
-        util_qca_set_int_lazy(vif, "getdbgLVL", "dbgLVL", D(vconf->vif_dbg_lvl, 0));
-
-    if (changed->rrm)
-        util_qca_set_int_lazy(vif, "get_rrm", "rrm", D(vconf->rrm, 0));
+        util_set_int_lazy(vif, "getdbgLVL", "dbgLVL", D(vconf->vif_dbg_lvl, 0));
 
     if (rconf->tx_power_exists)
-        WARN_ON(!strexa("iwconfig", vif, "txpower", strfmta("%d", rconf->tx_power)));
+        util_set_tx_power(phy, rconf->tx_power);
 
     util_vif_config_athnewind(phy);
 
     if ((changed->mac_list_type) || (changed->mac_list)) {
         if (vconf->mac_list_type_exists)
-            if (util_hostapd_acl_update(phy, vif,
+            if (!util_hostapd_acl_update(phy, vif,
                                         vconf->mac_list_type,
                                         util_vif_get_vconf_maclist(vconf, A(4096))))
-                LOGT("%s: failed to update mac acl configurations");
+                LOGT("%s: failed to update mac acl configurations", __func__);
     }
 
-    if (!strcmp(vconf->mode, "ap"))
-        if (changed->min_hw_mode)
-            util_vif_min_hw_mode_set(vif, vconf->min_hw_mode);
-
-    qca_ctrl_apply(vif, vconf, rconf, cconfs, num_cconfs);
+    hostap_ctrl_apply(vif, vconf, rconf, cconfs, num_cconfs);
     if (changed->wps_pbc || changed->wps || changed->wps_pbc_key_id) {
-        qca_ctrl_wps_session(vif, vconf->wps, vconf->wps_pbc);
+        hostap_ctrl_wps_session(vif, vconf->wps, vconf->wps_pbc);
         util_ovsdb_wpa_clear(vconf->if_name);
     }
 done:
@@ -4338,7 +3205,7 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
         return false;
     }
 
-    if ((vstate->mode_exists = util_iwconfig_get_opmode(vif, buf, sizeof(buf))))
+    if ((vstate->mode_exists = util_get_opmode(vif, buf, sizeof(buf))))
         STRSCPY(vstate->mode, buf);
 
     if (util_wifi_is_ap_vlan(vif)) {
@@ -4348,13 +3215,13 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
             SCHEMA_SET_STR(vstate->ap_vlan_sta_addr, buf);
     }
 
-    if ((vstate->ssid_broadcast_exists = util_qca_get_int(vif, "get_hide_ssid", &v)))
+    if ((vstate->ssid_broadcast_exists = util_get_int(vif, "get_hide_ssid", &v)))
         STRSCPY(vstate->ssid_broadcast, v ? "disabled" : "enabled");
 
-    if ((vstate->dynamic_beacon_exists = util_qca_get_int(vif, "g_dynamicbeacon", &v)))
+    if ((vstate->dynamic_beacon_exists = util_get_int(vif, "g_dynamicbeacon", &v)))
         vstate->dynamic_beacon = !!v;
 
-    if ((vstate->mcast2ucast_exists = util_qca_get_int(vif, "g_mcastenhance", &v)))
+    if ((vstate->mcast2ucast_exists = util_get_int(vif, "g_mcastenhance", &v)))
         vstate->mcast2ucast = !!v;
 
     vstate->mac_list_type_exists = util_hostapd_get_mac_acl(phy, vif, vstate);
@@ -4362,11 +3229,8 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
     if ((vstate->mac_exists = (0 == util_net_get_macaddr_str(vif, buf, sizeof(buf)))))
         STRSCPY(vstate->mac, buf);
 
-    if ((vstate->wds_exists = util_qca_get_int(vif, "get_wds", &v)))
+    if ((vstate->wds_exists = util_get_int(vif, "get_wds", &v)))
         vstate->wds = !!v;
-
-    if ((vstate->rrm_exists = util_qca_get_int(vif, "get_rrm", &v)))
-        vstate->rrm = !!v;
 
     if ((vstate->channel_exists = util_get_vif_chan(vif, &v)))
         vstate->channel = v;
@@ -4378,23 +3242,23 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
         vstate->vif_radio_idx = v;
 
 #if 0
-    // TODO: Identify API to set/get min_hw_mode
     if (!strcmp(vstate->mode, "ap"))
         if ((vstate->min_hw_mode_exists = (r = util_vif_min_hw_mode_get(vif))))
             STRSCPY(vstate->min_hw_mode, r);
-    // TODO: Identify API to set/get ap_bridge
-    if ((vstate->ap_bridge_exists = util_qca_get_int(vif, "get_ap_bridge", &v)))
+    if ((vstate->ap_bridge_exists = util_get_int(vif, "get_ap_bridge", &v)))
         vstate->ap_bridge = !!v;
 #else
-    if (strstr(vstate->if_name, "home_ap_24")) {
+    // TODO: Identify API to set/get min_hw_mode
+    if (strstr(vstate->if_name, HOME_AP_24)) {
         vstate->min_hw_mode_exists = true;
         STRSCPY(vstate->min_hw_mode, "11b");
     }
-    if (strstr(vstate->if_name, "bhaul-ap-24")) {
+    if (strstr(vstate->if_name, BHAUL_AP_24)) {
         vstate->min_hw_mode_exists = true;
         STRSCPY(vstate->min_hw_mode, "11g");
     }
-    if (strstr(vstate->if_name, "home_ap")) {
+    // TODO: Identify API to set/get ap_bridge
+    if (strstr(vstate->if_name, HOME_AP_PREFIX)) {
         vstate->ap_bridge_exists = true;
         vstate->ap_bridge = 0;
     }
@@ -4413,9 +3277,6 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
 static void
 target_radio_config_init_check_runtime(void)
 {
-    assert(0 == util_exec_simple("which", "wlanconfig"));
-    assert(0 == util_exec_simple("which", "iwconfig"));
-    assert(0 == util_exec_simple("which", "iwpriv"));
     assert(0 == util_exec_simple("which", "hostapd"));
     assert(0 == util_exec_simple("which", "hostapd_cli"));
     assert(0 == util_exec_simple("which", "wpa_supplicant"));
@@ -4428,84 +3289,26 @@ target_radio_config_init_check_runtime(void)
     assert(0 == util_exec_simple("which", "basename"));
 }
 
-bool
-target_radio_config_need_reset(void)
-{
-    return !strcasecmp("y", getenv("QCA_TARGET_CONFIG_NEED_RESET") ?: "n");
-}
-
-bool
-target_radio_config_init2(void)
-{
-    bool ok;
-    int i;
-    int j;
-    int k;
-
-    /* Normally this is reserved for 3rd party middleware
-     * interactions on residential gateways where OVSDB isn't the only
-     * configuration storage.
-     *
-     * Target implementation are not supposed to access OVSDB
-     * directly. The code below is an example to express what can be
-     * done when integrating with 3rd party configuration entity.
-     */
-
-    ok = false;
-
-    if (!g_rconfs || !g_vconfs)
-        goto free;
-
-    for (i = 0; i < g_num_rconfs; i++) {
-        schema_Wifi_Radio_Config_mark_all_present(&g_rconfs[i]);
-        /* WM controls vif_configs internally and op_vconf allows expressing
-         * what rconf a vconf belongs to by if_name.
-         */
-        g_rconfs[i].vif_configs_present = false;
-        g_rconfs[i]._partial_update = true;
-    }
-
-    for (i = 0; i < g_num_vconfs; i++) {
-        schema_Wifi_VIF_Config_mark_all_present(&g_vconfs[i]);
-        g_vconfs[i]._partial_update = true;
-    }
-
-    for (i = 0; i < g_num_rconfs; i++) {
-        rops.op_rconf(&g_rconfs[i]);
-        for (j = 0; j < g_rconfs[i].vif_configs_len; j++)
-            for (k = 0; k < g_num_vconfs; k++)
-                if (!strcmp(g_vconfs[k]._uuid.uuid, g_rconfs[i].vif_configs[j].uuid))
-                    rops.op_vconf(&g_vconfs[k], g_rconfs[i].if_name);
-    }
-    ok = true;
-
-free:
-    free(g_rconfs);
-    free(g_vconfs);
-    g_rconfs = NULL;
-    g_vconfs = NULL;
-    g_num_rconfs = 0;
-    g_num_vconfs = 0;
-    return ok;
-}
-
 static void
 target_radio_init_discover(EV_P_ ev_async *async, int events)
 {
-    char *ifnames = strexa("iwinfo");
-    char *line;
-    char *ifname;
+    DIR *d;
+    struct dirent *p;
+
+    if (!(d = opendir("/sys/class/net")))
+        return -1;
 
     LOGI("enumerating interfaces");
-    while ((line = strsep(&ifnames, "\n")))
-        if (!isspace(line[0]) && (ifname = strsep(&line, " \t")))
-            if (strlen(ifname) > 0) {
-                qca_ctrl_discover(ifname);
-                if (strstr(ifname, "wlan") == ifname)
-                    util_cb_delayed_update(UTIL_CB_PHY, ifname);
-                else if (strchomp(R(F("/sys/class/net/%s/phy80211/name", ifname)), "\r\n "))
-                    util_cb_delayed_update(UTIL_CB_VIF, ifname);
-            }
+    for (p = readdir(d); p ; p = readdir(d)) {
+        // Check whether wifi radio interfaces wlanX are already present
+        if (strstr(p->d_name, "wlan"))
+            util_cb_delayed_update(UTIL_CB_PHY, p->d_name);
+        // Check whether wifi vif interfaces are already present
+        else if (access(F("/sys/class/net/%s/phy80211/name", p->d_name), F_OK) == 0)
+            util_cb_delayed_update(UTIL_CB_VIF, p->d_name);
+    }
+
+    closedir(d);
 
     ev_async_stop(EV_DEFAULT, async);
 }
@@ -4518,8 +3321,8 @@ target_radio_init(const struct target_radio_ops *ops)
     ovsdb_table_t table_Wifi_VIF_Config;
 
     rops = *ops;
-    // TODO : Remove
-    //target_radio_config_init_check_runtime();
+
+    target_radio_config_init_check_runtime();
 
     target_nl80211_init(NULL);
 
@@ -4547,6 +3350,8 @@ target_radio_init(const struct target_radio_ops *ops)
     OVSDB_TABLE_INIT(Wifi_VIF_Config, if_name);
     g_rconfs = ovsdb_table_select_where(&table_Wifi_Radio_Config, NULL, &g_num_rconfs);
     g_vconfs = ovsdb_table_select_where(&table_Wifi_VIF_Config, NULL, &g_num_vconfs);
+
+    nl_req_init_channels(g_chan_status);
 
 #if defined(AP_STA_CONNECTED_PWD)
 #error "Legacy multi-psk hostapd patches not supported. Use upstream patches."
