@@ -29,10 +29,21 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "os.h"
 #include "log.h"
-#include "hostapd_util.h"
 #include "dpp_types.h"
+#include "ovsdb.h"
+#include "ovsdb_update.h"
+#include "ovsdb_sync.h"
+#include "ovsdb_table.h"
+#include "ovsdb_cache.h"
+
+#include "hostapd_util.h"
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
+
+#define CHAN_SWITCH_DEFAULT_CS_COUNT 15
+
+#define for_each_mac(mac, list) \
+    for (mac = strtok(list, " \t\n"); mac; mac = strtok(NULL, " \t\n"))
 
 bool hostapd_client_disconnect(const char *vif, const char *disc_type, const char *mac_str, uint8_t reason)
 {
@@ -143,7 +154,7 @@ bool hostapd_rrm_remove_neighbor(const char *vif, const char *bssid)
     return ret;
 }
 
-bool hostapd_acl_update(const char *vif, const uint8_t *mac_addr, int add)
+bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add)
 {
     char hostapd_cmd[1024];
     bool ret = true;
@@ -157,7 +168,7 @@ bool hostapd_acl_update(const char *vif, const uint8_t *mac_addr, int add)
             "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
             "DENY_ACL %s "MAC_ADDRESS_FORMAT,
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
-            add ? "DEL_MAC" : "ADD_MAC", MAC_ADDRESS_PRINT(mac_addr));
+            add ? "ADD_MAC" : "DEL_MAC", MAC_ADDRESS_PRINT(mac_addr));
 
     status = !cmd_log(hostapd_cmd);
     if (!status) {
@@ -166,4 +177,224 @@ bool hostapd_acl_update(const char *vif, const uint8_t *mac_addr, int add)
     }
 
     return ret;
+}
+
+int hostapd_mac_acl_clear(const char *phy, const char *vif)
+{
+    char hostapd_cmd[1024];
+    bool status;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+        "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
+        "ACCEPT_ACL CLEAR",
+        HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
+
+    status = !cmd_log(hostapd_cmd);
+    if (!status)
+        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+        "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
+        "DENY_ACL CLEAR",
+        HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
+
+    status = !cmd_log(hostapd_cmd);
+    if (!status)
+        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
+
+    return 0;
+}
+
+bool hostapd_mac_acl_accept_add(const char *phy, const char *vif, const char *mac_list_buf)
+{
+    char hostapd_cmd[1024];
+    bool ret = true;
+    bool status;
+    char *mac;
+    char *p;
+
+    hostapd_mac_acl_clear(phy, vif);
+
+    for_each_mac(mac, (p = strdup(mac_list_buf))) {
+        snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
+            "ACCEPT_ACL ADD_MAC %s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac);
+
+        status = !cmd_log(hostapd_cmd);
+        if (!status) {
+            ret = false;
+            LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+        }
+    }
+
+    free(p);
+
+    return ret;
+}
+
+bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_list_buf)
+{
+    char hostapd_cmd[1024];
+    bool ret = true;
+    bool status;
+    char *mac;
+    char *p;
+
+    hostapd_mac_acl_clear(phy, vif);
+
+    for_each_mac(mac, (p = strdup(mac_list_buf))) {
+        snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
+            "DENY_ACL ADD_MAC %s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac);
+
+        status = !cmd_log(hostapd_cmd);
+        if (!status) {
+            ret = false;
+            LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+        }
+    }
+
+    free(p);
+
+    return ret;
+}
+
+bool hostapd_get_mac_acl_info(const char *phy,
+                         const char *vif,
+                         struct schema_Wifi_VIF_State *vstate)
+{
+    char *accept_buf = NULL;
+    char *deny_buf = NULL;
+    char *buf = NULL;
+    char sockdir[64];
+    char *line;
+    char *mac_addr;
+
+    if (strstr(vif, "sta"))
+        return false;
+
+    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
+
+    accept_buf = HOSTAPD_CLI(sockdir, vif, "ACCEPT_ACL", "SHOW");
+
+    deny_buf = HOSTAPD_CLI(sockdir, vif, "DENY_ACL", "SHOW");
+
+    if ((deny_buf && (strlen(deny_buf) > 0)) && (!accept_buf || !strlen(accept_buf)))
+        STRSCPY(vstate->mac_list_type, "blacklist");
+    else if ((accept_buf && (strlen(accept_buf)) > 0) && (!deny_buf || !strlen(deny_buf)))
+        STRSCPY(vstate->mac_list_type, "whitelist");
+    else
+        return false;
+
+    if (strlen(deny_buf) > 0)
+        buf = strdupa(deny_buf);
+    else
+        buf = strdupa(accept_buf);
+
+    while (line = strsep(&buf, "\n"))
+        if (mac_addr = strsep(&line, " "))
+            if (strlen(mac_addr) > 0) {
+                STRSCPY(vstate->mac_list[vstate->mac_list_len], mac_addr);
+                vstate->mac_list_len++;
+            }
+
+    return true;
+}
+
+bool hostapd_status_get_hw_mode(const char *phy, char *ap_vif, char *buf, int buf_len)
+{
+    char sockdir[64] = "";
+    char *bss_status;
+    const char *k;
+    const char *v;
+    char *kv;
+    int is_11n = 0;
+    int is_11ac = 0;
+    int is_11ax = 0;
+
+    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
+
+    bss_status = HOSTAPD_CLI(sockdir, ap_vif, "STATUS");
+    if (!bss_status || (!strlen(bss_status)))
+        return false;
+
+    while ((kv = strsep(&bss_status, "\r\n"))) {
+        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+            if (!strcmp(k, "ieee80211n"))
+                is_11n = atoi(v);
+            if (!strcmp(k, "ieee80211ac"))
+                is_11ac = atoi(v);
+            if (!strcmp(k, "ieee80211ax"))
+                is_11ax = atoi(v);
+        }
+    }
+
+    if (is_11ax)
+        strscpy(buf, "11ax", buf_len);
+    else if (is_11ac)
+        strscpy(buf, "11ac", buf_len);
+    else if (is_11n)
+        strscpy(buf, "11n", buf_len);
+    else
+        return false;
+
+    return true;
+}
+
+bool hostapd_status_get_bcn_int(const char *phy, char *ap_vif, int *val)
+{
+    char sockdir[64] = "";
+    char *bss_status;
+    const char *k;
+    const char *v;
+    char *kv;
+
+    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
+
+    bss_status = HOSTAPD_CLI(sockdir, ap_vif, "STATUS");
+    if (!bss_status || (!strlen(bss_status)))
+        return false;
+
+    while ((kv = strsep(&bss_status, "\r\n"))) {
+        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+            if (!strcmp(k, "beacon_int")) {
+                *val = atoi(v);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+int hostapd_chan_switch(const char *phy,
+                        const char *vif,
+                        int channel,
+                        char *center_freq1_str,
+                        char *sec_chan_offset_str,
+                        char *opt_chan_info)
+{
+    char hostapd_cmd[1024] = "";
+    bool status;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s CHAN_SWITCH %d %d %s %s %s",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
+            CHAN_SWITCH_DEFAULT_CS_COUNT,
+            util_chan_to_freq(channel),
+            strlen(center_freq1_str) ? center_freq1_str : "",
+            strlen(sec_chan_offset_str) ? sec_chan_offset_str : "",
+            strlen(opt_chan_info) ? opt_chan_info : "");
+
+    LOGI("%s: %s", __func__, hostapd_cmd);
+
+    status = !cmd_log(hostapd_cmd);
+    if (!status) {
+        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
+        return -1;
+    }
+
+    return 0;
 }

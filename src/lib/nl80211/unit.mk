@@ -38,13 +38,16 @@ UNIT_SRC += src/nl_util.c
 UNIT_SRC += src/target_nl80211.c
 UNIT_SRC += src/stats_nl80211.c
 UNIT_SRC += src/stats_util.c
+UNIT_SRC += src/bsal_nl80211.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -I$(STAGING_DIR)/usr/include/libnl3/
 UNIT_CFLAGS += -Isrc/lib/datapipeline/inc
+UNIT_CFLAGS += -I$(UNIT_PATH)/../bsal/inc/
 
-#UNIT_LDFLAGS := -lev -lnl-tiny
 UNIT_LDFLAGS := -lev -lnl-3 -lnl-genl-3 -lubox
+
+UNIT_DEPS_CFLAGS := src/lib/target
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
 UNIT_EXPORT_LDFLAGS := $(UNIT_LDFLAGS)

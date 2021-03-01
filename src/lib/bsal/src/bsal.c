@@ -128,34 +128,6 @@ struct ieee80211_mgmt {
     } u;
 };
 
-enum xing_level {
-    SNR_NONE,
-    SNR_ABOVE_HWM,
-    SNR_BETWEEN_HWM_LWM,
-    SNR_BELOW_LWM
-};
-
-typedef struct {
-    os_macaddr_t            mac_addr;
-    char                    ifname[IFNAMSIZ];
-    bool                    connected;
-    uint8_t                 is_BTM_supported;
-    uint8_t                 is_RRM_supported;
-    bool                    band_cap_2G;
-    bool                    band_cap_5G;
-    bsal_datarate_info_t    datarate_info;
-    bsal_rrm_caps_t         rrm_caps;
-    uint8_t                 assoc_ies[BSAL_MAX_ASSOC_IES_LEN];
-    uint16_t                assoc_ies_len;
-    uint8_t                 snr;
-    uint64_t                tx_bytes;
-    uint64_t                rx_bytes;
-    uint8_t                 snr_lwm_xing;
-    uint8_t                 snr_hwm_xing;
-    enum xing_level         xing_level;
-    ds_dlist_node_t         node;
-} bsal_cli_info;
-
 #define for_each_element(_elem, _data, _datalen)                        \
         for (_elem = (const struct element *) (_data);                  \
              (const uint8_t *) (_data) + (_datalen) - (const uint8_t *) _elem >=  \
@@ -165,8 +137,8 @@ typedef struct {
              _elem = (const struct element *) (_elem->data + _elem->datalen))
 
 #define IEEE80211_HDRLEN (sizeof(struct ieee80211_hdr))
-#define DEFAULT_NOISE_FLOOR (-95)
-#define IEEE80211_FIXED_PARAM_LEN 4
+#define IEEE80211_FIXED_PARAM_LEN_ASSOC 4
+#define IEEE80211_FIXED_PARAM_LEN_REASSOC 10
 #define WLAN_EID_SUPP_RATES 1
 #define WLAN_EID_RRM_ENABLED_CAPABILITIES 70
 #define WLAN_EID_HT_CAP 45
@@ -176,16 +148,19 @@ typedef struct {
 
 #define BSAL_CLI_SNR_POLL_INTERVAL 5
 
+#define BM_CLIENT_MAGIC_HWM 1
+
 struct nl_global_info       bsal_nl_global;
-static ev_async             bsal_nl_global_async;
-static ev_io                nl_ev_loop;
+static ev_async             bsal_nl_ev_async;
+static ev_io                bsal_nl_ev_loop;
 static ev_timer             bsal_cli_snr_poll;
 
 static struct ev_loop       *_ev_loop           = NULL;
 static bsal_event_cb_t      _bsal_event_cb      = NULL;
 
-
 static ds_dlist_t bsal_cli_info_list = DS_DLIST_INIT(bsal_cli_info, node);
+
+int bsal_nl_event_parse(struct nl_msg *msg, void *arg);
 
 /***************************************************************************************/
 
@@ -215,250 +190,6 @@ static bsal_cli_info* bsal_get_client(const char *ifname, const os_macaddr_t *ma
     }
 
     return NULL;
-}
-
-/***************************************************************************************/
-
-static int finish_handler(struct nl_msg *msg, void *arg)
-{
-    return NL_SKIP;
-}
-
-static int err_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg)
-{
-    return NL_SKIP;
-}
-
-static int no_seq_check(struct nl_msg *msg, void *arg)
-{
-    return NL_OK;
-}
-
-int nl_resp_parse_ssid(struct nl_msg *msg, void *arg)
-{
-    char *ssid = arg;
-    int len = 0;
-    struct nlattr *tb[NL80211_ATTR_MAX + 1];
-    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
-
-    memset(tb, 0, sizeof(tb));
-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
-
-    if (!tb[NL80211_ATTR_SSID]) {
-        LOGT("SSID information unavailable");
-        return NL_SKIP;
-    }
-
-    len = nla_len(tb[NL80211_ATTR_SSID]);
-    strlcpy(ssid, nla_data(tb[NL80211_ATTR_SSID]), (len > SSID_MAX_LEN) ? SSID_MAX_LEN : (len + 1));
-
-    return NL_OK;
-}
-
-int nl_req_get_ssid(const char *ifname, char *ssid)
-{
-    int if_index = -EINVAL;
-    struct nl_msg *msg;
-
-    if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
-        return false;
-
-    msg = nlmsg_init(&bsal_nl_global, NL80211_CMD_GET_INTERFACE, false);
-    if (!msg)
-        return false;
-
-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
-
-    return nlmsg_send_and_recv(&bsal_nl_global, msg, nl_resp_parse_ssid, ssid);
-}
-
-int rssi_to_snr(int rssi)
-{
-    return (rssi - DEFAULT_NOISE_FLOOR);
-}
-
-int nl_resp_parse_sta_rssi(struct nl_msg *msg, void *arg)
-{
-    struct nlattr       *tb[NL80211_ATTR_MAX + 1];
-    struct genlmsghdr   *gnlh = nlmsg_data(nlmsg_hdr(msg));
-    struct nlattr       *sinfo[NL80211_STA_INFO_MAX + 1] = { 0 };
-    int8_t              *rssi = (int8_t *)arg;
-
-    static struct nla_policy    sta_info_policy[NL80211_STA_INFO_MAX + 1] = {
-        [NL80211_STA_INFO_SIGNAL_AVG]    = { .type = NLA_U8     },
-    };
-
-    memset(tb, 0, sizeof(tb));
-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
-
-    if (!tb[NL80211_ATTR_STA_INFO])
-        return;
-
-    if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX, tb[NL80211_ATTR_STA_INFO], sta_info_policy))
-        return;
-
-    if (sinfo[NL80211_STA_INFO_SIGNAL_AVG])
-        *rssi = (int8_t) nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]);
-
-    return NL_OK;
-}
-
-int nl_req_get_sta_rssi(const char *ifname, const uint8_t *mac_addr, int8_t *rssi)
-{
-    struct nl_msg *msg;
-    int if_index = -EINVAL;
-
-    if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
-        return -EINVAL;
-
-    msg = nlmsg_init(&bsal_nl_global, NL80211_CMD_GET_STATION, false);
-    if (!msg)
-        return -EINVAL;
-
-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
-
-    nla_put(msg, NL80211_ATTR_MAC, MAC_ADDR_LEN, mac_addr);
-
-    nlmsg_send_and_recv(&bsal_nl_global, msg, nl_resp_parse_sta_rssi, rssi);
-
-    return 0;
-}
-
-void nl_resp_parse_sta_info(struct nl_msg *msg, void *arg)
-{
-    int ies_len;
-    const struct element *elem;
-    struct nlattr *tb[NL80211_ATTR_MAX + 1];
-    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
-    bsal_cli_info *data = (bsal_cli_info *) arg;
-    struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1] = { };
-    static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
-        [NL80211_STA_INFO_SIGNAL_AVG]    = { .type = NLA_U8     },
-        [NL80211_STA_INFO_RX_BYTES]      = { .type = NLA_U32    },
-        [NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
-    };
-
-    memset(tb, 0, sizeof(tb));
-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
-
-    if (!tb[NL80211_ATTR_STA_INFO])
-        return;
-
-    if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX, tb[NL80211_ATTR_STA_INFO], stats_policy))
-        return;
-
-    if (sinfo[NL80211_STA_INFO_SIGNAL_AVG])
-        data->snr = rssi_to_snr((int32_t) nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]));
-
-    if (sinfo[NL80211_STA_INFO_RX_BYTES])
-        data->rx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]);
-
-    if (sinfo[NL80211_STA_INFO_TX_BYTES])
-        data->tx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
-
-    data->connected = true;
-
-    if (!tb[NL80211_ATTR_IE])
-        return;
-
-    ies_len = nla_len(tb[NL80211_ATTR_IE]);
-    if ((ies_len > 0) && (ies_len < sizeof(data->assoc_ies))) {
-        memcpy(data->assoc_ies, nla_data(tb[NL80211_ATTR_IE]), ies_len);
-        data->assoc_ies_len = ies_len;
-    } else if (ies_len > sizeof(data->assoc_ies)) {
-        LOGI("%s: received assoc ie length[%d] exceeds bsal assoc_ies buffer len[%d]",
-             __func__, ies_len, sizeof(data->assoc_ies));
-    }
-
-    return;
-}
-
-int nl_req_get_sta_info(const char *ifname, const uint8_t *mac_addr, bsal_cli_info *data)
-{
-    struct nl_msg *msg;
-    int if_index;
-
-    if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
-        return -EINVAL;
-
-    msg = nlmsg_init(&bsal_nl_global, NL80211_CMD_GET_STATION, false);
-    if (!msg)
-        return -EINVAL;
-
-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
-    nla_put(msg, NL80211_ATTR_MAC, MAC_ADDR_LEN, mac_addr);
-
-    nlmsg_send_and_recv(&bsal_nl_global, msg, nl_resp_parse_sta_info, data);
-
-    return 0;
-}
-
-static void bsal_nl_evt_parse_conn_failed(struct nlattr **tb)
-{
-    int reason;
-    bsal_event_t event = { 0 };
-
-    if (!tb[NL80211_ATTR_MAC] || !tb[NL80211_ATTR_CONN_FAILED_REASON])
-        return;
-
-    event.type = BSAL_EVENT_AUTH_FAIL;
-    memcpy(&event.data.auth_fail.client_addr, nla_data(tb[NL80211_ATTR_MAC]), BSAL_MAC_ADDR_LEN);
-    event.data.auth_fail.rssi   = 0; /* TODO: Currently unavailable */
-    event.data.auth_fail.reason = 1; /* Unspecified */
-
-    if (tb[NL80211_ATTR_IFNAME])
-        strncpy(event.ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
-
-    reason = nla_get_u32(tb[NL80211_ATTR_CONN_FAILED_REASON]);
-    switch (reason) {
-    case NL80211_CONN_FAIL_MAX_CLIENTS:
-        /* Maximum number of clients that can be handled by the AP is reached */
-        event.data.auth_fail.bs_rejected = 1;
-        LOGI("%s: Max client reached", __func__);
-        break;
-    case NL80211_CONN_FAIL_BLOCKED_CLIENT:
-        /* Connection request is rejected due to ACL */
-        event.data.auth_fail.bs_blocked = 1;
-        event.data.auth_fail.bs_rejected = 1;
-        LOGI("%s: Blocked client " PRI(os_macaddr_t), __func__,
-             FMT(os_macaddr_t, *(os_macaddr_t *)event.data.auth_fail.client_addr));
-        break;
-    default:
-        LOGI("%s: Unknown connect failed reason %u", __func__, reason);
-        break;
-    }
-
-    LOGI("%s: Sending BSAL_EVENT_AUTH_FAIL for mac=" PRI(os_macaddr_t)
-         " with reason=%d bs_rejected=%d bs_blocked=%d rssi=%d",
-         __func__,
-        FMT(os_macaddr_t, *(os_macaddr_t *)event.data.auth_fail.client_addr),
-        event.data.auth_fail.reason,
-        event.data.auth_fail.bs_rejected,
-        event.data.auth_fail.bs_blocked,
-        event.data.auth_fail.rssi);
-
-    _bsal_event_cb(&event);
-
-    return;
-}
-
-static int bsal_nl_event_parse(struct nl_msg *msg, void *arg)
-{
-    struct genlmsghdr   *gnlh = nlmsg_data(nlmsg_hdr(msg));
-    struct nlattr       *tb[NL80211_ATTR_MAX + 1];
-
-    memset(tb, 0, sizeof(tb));
-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
-
-    switch (gnlh->cmd) {
-        case NL80211_CMD_CONN_FAILED:
-            bsal_nl_evt_parse_conn_failed(tb);
-            break;
-        default:
-            break;
-    }
-
-    return NL_OK;
 }
 
 /***************************************************************************************/
@@ -529,14 +260,14 @@ void bsal_cli_rssi_xing(void)
         if (!client->connected)
             continue;
 
-        if (nl_req_get_sta_rssi(client->ifname, (uint8_t *) &client->mac_addr, &rssi) < 0) {
+        if (nl_req_get_sta_rssi(&bsal_nl_global, client->ifname, (uint8_t *) &client->mac_addr, &rssi) < 0) {
             LOGD("%s: Failed to get station information for "PRI(os_macaddr_t),
                  __func__, FMT(os_macaddr_t, client->mac_addr));
             continue;
         }
 
         if (rssi != 0) {
-            event.data.rssi_change.rssi = rssi_to_snr(rssi);
+            event.data.rssi_change.rssi = rssi_to_snr(&bsal_nl_global, util_sys_ifname_to_idx(client->ifname), rssi);
 
             old_xing_level = client->xing_level;
             client->xing_level = get_curr_snr_xing_status(event.data.rssi_change.rssi, client);
@@ -648,7 +379,7 @@ static void bsal_hapd_frame_disconnect(struct hapd *hapd, const char *in_buf)
     return;
 }
 
-static void bsal_process_assoc_req_frame(const char *ifname, const char *frame)
+static void bsal_process_assoc_req_frame(const char *ifname, const char *frame, int reassoc)
 {
     char                    *buf;
     const uint8_t           *ies;
@@ -660,6 +391,7 @@ static void bsal_process_assoc_req_frame(const char *ifname, const char *frame)
     const struct element    *elem;
     const uint8_t           *ext_cap;
     const uint8_t           *rrm_cap;
+    int                     fixed_param_len = 0;
 
     alloc_buf_size = strlen(frame) / 2;
     buf = calloc(alloc_buf_size, sizeof(uint8_t));
@@ -670,8 +402,14 @@ static void bsal_process_assoc_req_frame(const char *ifname, const char *frame)
 
     mgmt = (struct ieee80211_mgmt *) buf;
 
-    ies = ((const uint8_t *) buf) + IEEE80211_HDRLEN + IEEE80211_FIXED_PARAM_LEN;
-    ies_len = buf_len - IEEE80211_HDRLEN - IEEE80211_FIXED_PARAM_LEN;
+    if (reassoc)
+        fixed_param_len = IEEE80211_FIXED_PARAM_LEN_REASSOC;
+    else
+        fixed_param_len = IEEE80211_FIXED_PARAM_LEN_ASSOC;
+
+    // TODO: use u.(re)assoc_req.variable instead of calulating ies position
+    ies = ((const uint8_t *) buf) + IEEE80211_HDRLEN + fixed_param_len;
+    ies_len = buf_len - IEEE80211_HDRLEN - fixed_param_len;
     if (ies_len <= 0)
         goto error;
 
@@ -745,14 +483,18 @@ static void nl80211_cmd_frame_event(struct hapd *hapd, const char *in_buf)
     const char  *v;
     char        *parse_buf = strdupa(in_buf);
     char        assoc_frame[BFR_SIZE_1K] = { 0 };
+    int         reassoc = 0;
+
+    if (strstr(parse_buf, EVT_FRAME_REASSOC_REQ))
+        reassoc = 1;
 
     // NL80211-CMD-FRAME type=EVT-FRAME-ASSOC-REQ buf=<frame hex dump>
-    if (strstr(parse_buf, EVT_FRAME_ASSOC_REQ))
+    if (strstr(parse_buf, EVT_FRAME_ASSOC_REQ) || strstr(parse_buf, EVT_FRAME_REASSOC_REQ))
         while ((kv = strsep(&parse_buf, " ")))
             if ((k = strsep(&kv, "=")) && (v = strsep(&kv, "")))
                 if (!strcmp(k, "buf")) {
                     strscpy(assoc_frame, v, sizeof(assoc_frame));
-                    bsal_process_assoc_req_frame(hapd->ctrl.bss, assoc_frame);
+                    bsal_process_assoc_req_frame(hapd->ctrl.bss, assoc_frame, reassoc);
                 }
 }
 
@@ -820,8 +562,11 @@ static void bsal_hapd_frame_probe_req(struct hapd *hapd, const char *buf)
     // NL80211-CMD-FRAME type=EVT-FRAME-PROBE-REQ sa=9a:00:80:9d:d4:66 ssi_signal=-79 ssid_null=1
     while ((kv = strsep(&buf, " "))) {
         if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
-            if (!strcmp(k, "ssi_signal"))
-                event.data.probe_req.rssi = rssi_to_snr(atoi(v));
+            if (!strcmp(k, "ssi_signal")) {
+                event.data.probe_req.rssi = rssi_to_snr(&bsal_nl_global,
+                                                        util_sys_ifname_to_idx(hapd->ctrl.bss),
+                                                        atoi(v));
+            }
             if (!strcmp(k, "ssid_null"))
                 event.data.probe_req.ssid_null = atoi(v);
             if (!strcmp(k, "sa"))
@@ -894,16 +639,13 @@ int nl_bsal_iface_add(const bsal_ifconfig_t *ifcfg)
     return 0;
 }
 
-#if 0
 int nl_bsal_iface_update(const bsal_ifconfig_t *ifcfg)
 {
-    if (bsal_bs_config(ifcfg, true) < 0) {
+    if (bsal_bs_config(ifcfg, true) < 0)
         return -1;
-    }
 
     return 0;
 }
-#endif
 
 int nl_bsal_iface_remove(const bsal_ifconfig_t *ifcfg)
 {
@@ -917,13 +659,13 @@ static int hapd_cli_bsal_acl_mac(
         const uint8_t *mac_addr,
         bool add)
 {
-    if (!hostapd_acl_update(ifname, mac_addr, add)) {
-        LOGW("Failed to update MAC ACL list");
+    if (!hostapd_deny_acl_update(ifname, mac_addr, add)) {
+        LOGN("Failed to update MAC ACL list");
         return -1;
     }
 
     LOGI("%s: %s MAC DENY_ACL list updated - %s mac=" PRI(os_macaddr_t),
-         __func__, ifname, add ? "added" : "removed", FMT(os_macaddr_t, *(os_macaddr_t *) mac_addr));
+         __func__, ifname, add ? "blocked" : "unblocked", FMT(os_macaddr_t, *(os_macaddr_t *) mac_addr));
 
     return 0;
 }
@@ -943,6 +685,15 @@ static int bsal_bs_client_config(
              __func__, FMT(os_macaddr_t, client->mac_addr),
              client->snr_lwm_xing, client->snr_hwm_xing);
     }
+
+    // Blacklist station if not connected and HWM == 1
+    if (conf->rssi_probe_hwm == BM_CLIENT_MAGIC_HWM) {
+        if (!client->connected)
+            hapd_cli_bsal_acl_mac(ifname, mac_addr, true);
+    } else if (!conf->rssi_probe_hwm) {
+        hapd_cli_bsal_acl_mac(ifname, mac_addr, false);
+    }
+
     return 0;
 }
 
@@ -954,10 +705,6 @@ int nl_bsal_client_add(
     int ret;
     bsal_cli_info *client;
 
-    if ((ret = hapd_cli_bsal_acl_mac(ifname, mac_addr, true)) < 0) {
-        return ret;
-    }
-
     client = bsal_get_client(ifname, mac_addr);
     if (!client) {
         client = calloc(1, sizeof(bsal_cli_info));
@@ -965,8 +712,6 @@ int nl_bsal_client_add(
         memcpy(&client->mac_addr, mac_addr, sizeof(client->mac_addr));
         bsal_add_client(client);
     }
-    client->snr_lwm_xing = conf->rssi_low_xing;
-    client->snr_hwm_xing = conf->rssi_high_xing;
 
     return bsal_bs_client_config(ifname, mac_addr, conf);
 }
@@ -996,10 +741,10 @@ int nl_bsal_client_measure(
         const uint8_t *mac_addr,
         int num_samples)
 {
-    int8_t rssi;
+    int8_t rssi = 0;
     bsal_event_t event;
 
-    if (nl_req_get_sta_rssi(ifname, mac_addr, &rssi) < 0) {
+    if (nl_req_get_sta_rssi(&bsal_nl_global, ifname, mac_addr, &rssi) < 0) {
         LOGW("Failed to get station information");
         return -EINVAL;
     }
@@ -1007,7 +752,7 @@ int nl_bsal_client_measure(
     event.type = BSAL_EVENT_RSSI;
     STRSCPY(event.ifname, ifname);
     memcpy(&event.data.rssi.client_addr, mac_addr, sizeof(event.data.rssi.client_addr));
-    event.data.rssi.rssi = rssi_to_snr(rssi);
+    event.data.rssi.rssi = rssi_to_snr(&bsal_nl_global, util_sys_ifname_to_idx(ifname), rssi);
 
     LOGI("%s: bsal event.type:%d event.ifname:%s rssi:%d" PRI(os_macaddr_t),
          __func__, event.type, event.ifname, event.data.rssi.rssi,
@@ -1046,7 +791,7 @@ int nl_bsal_client_info(
     memcpy(info->assoc_ies, client->assoc_ies, sizeof(info->assoc_ies));
     info->assoc_ies_len = client->assoc_ies_len;
 
-    nl_req_get_sta_info(ifname, mac_addr, client);
+    nl_req_get_sta_info(&bsal_nl_global, ifname, mac_addr, client);
 
     info->snr = client->snr;
     info->connected = client->connected;
@@ -1109,7 +854,7 @@ static bool hapd_cli_rrm_bcn_rpt_request(
     char        hex_ssid[BFR_SIZE_128]           = { 0 };
 
     if (rrm_params->req_ssid == 1) {
-        nl_req_get_ssid(interface, cur_ssid);
+        nl_req_get_ssid(&bsal_nl_global, interface, cur_ssid);
         if (bintohex((const uint8_t *) cur_ssid, strlen(cur_ssid), hex_ssid, sizeof(hex_ssid)) < 0)
             LOGW("Failed to fetch ssid");
     }
@@ -1232,7 +977,7 @@ int nl_bsal_rrm_set_neighbor(
     char            cur_ssid[BFR_SIZE_128]   = { 0 };
     char            hex_ssid[BFR_SIZE_128]   = { 0 };
 
-    nl_req_get_ssid(ifname, cur_ssid);
+    nl_req_get_ssid(&bsal_nl_global, ifname, cur_ssid);
     if (bintohex((const uint8_t *) cur_ssid, strlen(cur_ssid), hex_ssid, sizeof(hex_ssid)) < 0)
         LOGW("Failed to fetch ssid");
 
@@ -1288,7 +1033,71 @@ int nl_bsal_send_action(
     return 0;
 }
 
-static void bsal_nl_ev_handler(struct ev_loop *ev, struct ev_io *io, int event)
+void bsal_nl_evt_parse_conn_failed(struct nlattr **tb)
+{
+    int reason;
+    bsal_event_t event = { 0 };
+
+    if (!tb[NL80211_ATTR_MAC] || !tb[NL80211_ATTR_CONN_FAILED_REASON])
+        return;
+
+    event.type = BSAL_EVENT_AUTH_FAIL;
+    memcpy(&event.data.auth_fail.client_addr, nla_data(tb[NL80211_ATTR_MAC]), BSAL_MAC_ADDR_LEN);
+    event.data.auth_fail.rssi   = 0; /* TODO: Currently unavailable */
+    event.data.auth_fail.reason = 1; /* Unspecified */
+
+    if (tb[NL80211_ATTR_IFNAME])
+        strncpy(event.ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
+
+    reason = nla_get_u32(tb[NL80211_ATTR_CONN_FAILED_REASON]);
+    switch (reason) {
+    case NL80211_CONN_FAIL_MAX_CLIENTS:
+        /* Maximum number of clients that can be handled by the AP is reached */
+        event.data.auth_fail.bs_rejected = 1;
+        LOGI("%s: Max client reached", __func__);
+        break;
+    case NL80211_CONN_FAIL_BLOCKED_CLIENT:
+        /* Connection request is rejected due to ACL */
+        event.data.auth_fail.bs_blocked = 1;
+        event.data.auth_fail.bs_rejected = 1;
+        LOGI("%s: Blocked client " PRI(os_macaddr_t), __func__,
+             FMT(os_macaddr_t, *(os_macaddr_t *)event.data.auth_fail.client_addr));
+        break;
+    default:
+        LOGI("%s: Unknown connect failed reason %u", __func__, reason);
+        break;
+    }
+
+    LOGI("%s: Sending BSAL_EVENT_AUTH_FAIL for mac=" PRI(os_macaddr_t)
+         " with reason=%d bs_rejected=%d bs_blocked=%d rssi=%d",
+         __func__,
+        FMT(os_macaddr_t, *(os_macaddr_t *)event.data.auth_fail.client_addr),
+        event.data.auth_fail.reason,
+        event.data.auth_fail.bs_rejected,
+        event.data.auth_fail.bs_blocked,
+        event.data.auth_fail.rssi);
+
+    _bsal_event_cb(&event);
+
+    return;
+}
+
+static int finish_handler(struct nl_msg *msg, void *arg)
+{
+    return NL_SKIP;
+}
+
+static int err_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg)
+{
+    return NL_SKIP;
+}
+
+static int no_seq_check(struct nl_msg *msg, void *arg)
+{
+    return NL_OK;
+}
+
+void bsal_nl_ev_handler(struct ev_loop *ev, struct ev_io *io, int event)
 {
     int res = -EINVAL;
 
@@ -1306,17 +1115,17 @@ void bsal_nl_global_init()
 {
     add_mcast_subscription(&bsal_nl_global, "mlme");
 
-    ev_io_init(&nl_ev_loop, bsal_nl_ev_handler, nl_socket_get_fd(bsal_nl_global.nl_evt_handle), EV_READ);
-    ev_io_start(_ev_loop, &nl_ev_loop);
+    ev_io_init(&bsal_nl_ev_loop, bsal_nl_ev_handler, nl_socket_get_fd(bsal_nl_global.nl_evt_handle), EV_READ);
+    ev_io_start(_ev_loop, &bsal_nl_ev_loop);
 
     return;
 }
 
 void bsal_nl_global_async_init()
 {
-    ev_async_init(&bsal_nl_global_async, bsal_nl_global_init);
-    ev_async_start(_ev_loop, &bsal_nl_global_async);
-    ev_async_send(_ev_loop, &bsal_nl_global_async);
+    ev_async_init(&bsal_nl_ev_async, bsal_nl_global_init);
+    ev_async_start(_ev_loop, &bsal_nl_ev_async);
+    ev_async_send(_ev_loop, &bsal_nl_ev_async);
 }
 
 int nl_bsal_init(
@@ -1356,8 +1165,8 @@ int nl_bsal_cleanup(void)
     nl_socket_free(bsal_nl_global.nl_evt_handle);
     nl_cb_put(bsal_nl_global.nl_cb);
     bsal_nl_global.nl_cb = NULL;
-    ev_io_stop(_ev_loop, &nl_ev_loop);
-    ev_async_stop(_ev_loop, &bsal_nl_global_async);
+    ev_io_stop(_ev_loop, &bsal_nl_ev_loop);
+    ev_async_stop(_ev_loop, &bsal_nl_ev_async);
 
     _ev_loop = NULL;
     _bsal_event_cb = NULL;

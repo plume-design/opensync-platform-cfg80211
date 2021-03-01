@@ -46,9 +46,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define MBM_TO_DBM(gain) ((gain) / 100)
 #define DBM_TO_MBM(gain) ((gain) * 100)
 
-static ev_io            nl_ev_loop;
-struct nl_global_info   nl_global;
-
 int nl_resp_parse_ht_mode(struct nl_msg *msg, void *arg)
 {
     int *ht_mode = (int *)arg;
@@ -67,22 +64,28 @@ int nl_resp_parse_ht_mode(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-bool nl_req_get_ht_mode(const char *ifname, char *ht_mode, int len)
+bool nl_req_get_ht_mode(struct nl_global_info *nl_global,
+                        const char *ifname,
+                        char *ht_mode,
+                        int len)
 {
     int if_index = -EINVAL;
     int ht_type = -EINVAL;
     struct nl_msg *msg;
     enum nl80211_chan_width chanwidth;
 
+    if (!nl_global)
+        return false;
+
     if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
         return false;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_INTERFACE, false);
     if (!msg)
         return false;
 
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_ht_mode, &ht_type);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_ht_mode, &ht_type);
     chanwidth = ht_type;
 
     return util_ht_mode(chanwidth, ht_mode, len);
@@ -93,7 +96,9 @@ int nl_resp_parse_iface_phy_idx(struct nl_msg *msg, void *arg)
     int *phy = arg;
     struct nlattr *attr;
 
-    attr = nlmsg_find_attr(nlmsg_hdr(msg), NLMSG_ALIGN(sizeof(struct genlmsghdr)), NL80211_ATTR_WIPHY);
+    attr = nlmsg_find_attr(nlmsg_hdr(msg),
+                           NLMSG_ALIGN(sizeof(struct genlmsghdr)),
+                           NL80211_ATTR_WIPHY);
     if (attr)
         *phy = nla_get_u32(attr);
 
@@ -101,18 +106,21 @@ int nl_resp_parse_iface_phy_idx(struct nl_msg *msg, void *arg)
 }
 
 /* Fetch phy index from interface */
-int nl_req_get_iface_phy_idx(int if_index)
+int nl_req_get_iface_phy_idx(struct nl_global_info *nl_global, int if_index)
 {
     struct nl_msg *msg;
     int phy_idx = -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    if (!nl_global)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_INTERFACE, false);
     if (!msg)
         return -ENOMEM;
 
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
 
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_iface_phy_idx, &phy_idx);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_iface_phy_idx, &phy_idx);
 
     return phy_idx;
 }
@@ -135,41 +143,47 @@ static int nl_resp_parse_txpwr(struct nl_msg *msg, void *txpwr)
     return NL_OK;
 }
 
-int nl80211_get_txpwr(const char *ifname)
+int nl_req_get_txpwr(struct nl_global_info *nl_global, const char *ifname)
 {
     int if_idx = -EINVAL;
     int txpwr = 0;
     struct nl_msg *msg;
 
+    if (!nl_global)
+        return -EINVAL;
+
     if ((if_idx = util_sys_ifname_to_idx(ifname)) < 0)
         return -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_INTERFACE, false);
     if (!msg)
         return -EINVAL;
 
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_idx);
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_txpwr, &txpwr);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_txpwr, &txpwr);
 
     return txpwr;
 }
 
-int nl80211_set_txpwr(const char *ifname, const int dbm)
+int nl_req_set_txpwr(struct nl_global_info *nl_global, const char *ifname, const int dbm)
 {
     int if_idx = -EINVAL;
     int phy_idx = -EINVAL;
     struct nl_msg *msg;
     enum nl80211_tx_power_setting type;
 
+    if (!nl_global)
+        return -EINVAL;
+
     if ((if_idx = util_sys_ifname_to_idx(ifname)) < 0)
         return -EINVAL;
 
-    if ((phy_idx = nl_req_get_iface_phy_idx(if_idx)) < 0)
+    if ((phy_idx = nl_req_get_iface_phy_idx(nl_global, if_idx)) < 0)
         return -EINVAL;
 
     type = NL80211_TX_POWER_LIMITED;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_SET_WIPHY, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_SET_WIPHY, false);
     if (!msg)
         return -EINVAL;
 
@@ -177,7 +191,7 @@ int nl80211_set_txpwr(const char *ifname, const int dbm)
 
     nla_put_u32(msg, NL80211_ATTR_WIPHY_TX_POWER_SETTING, type);
     nla_put_u32(msg, NL80211_ATTR_WIPHY_TX_POWER_LEVEL, DBM_TO_MBM(dbm));
-    nlmsg_send_and_recv(&nl_global, msg, NULL, NULL);
+    nlmsg_send_and_recv(nl_global, msg, NULL, NULL);
 
     return 0;
 }
@@ -259,26 +273,32 @@ int nl_resp_parse_channels(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-int nl_req_get_channels(const char *ifname, char *buf, int len)
+int nl_req_get_channels(struct nl_global_info *nl_global,
+                        const char *ifname,
+                        char *buf,
+                        int len)
 {
     struct nl_msg *msg;
     int phy_idx = -EINVAL;
     int if_idx = -EINVAL;
     struct data_buffer_4k chan_buf = { "", BFR_SIZE_4K};
 
+    if (!nl_global)
+        return -EINVAL;
+
     if ((if_idx = util_sys_ifname_to_idx(ifname)) < 0)
         return -EINVAL;
 
-    if ((phy_idx = nl_req_get_iface_phy_idx(if_idx)) < 0)
+    if ((phy_idx = nl_req_get_iface_phy_idx(nl_global, if_idx)) < 0)
         return -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_WIPHY, true);
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_WIPHY, true);
     if (!msg) return -ENOMEM;
 
     nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
     nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
 
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_channels, &chan_buf);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_channels, &chan_buf);
 
     strlcpy(buf, chan_buf.buf, len);
 
@@ -345,43 +365,66 @@ int nl_resp_parse_init_channels(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-int nl_req_init_channels(struct channel_status *chan_status)
+int nl_req_init_channels(struct nl_global_info *nl_global,
+                         const char *ifname,
+                         struct channel_status *chan_status)
 {
     struct nl_msg *msg;
+    int phy_idx = -EINVAL;
+    int iface_index = -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_WIPHY, true);
+    if (!nl_global)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_WIPHY, true);
     if (!msg) return -ENOMEM;
+
+    if (ifname) {
+        if ((iface_index = util_sys_ifname_to_idx(ifname)) < 0)
+            return -EINVAL;
+
+        if ((phy_idx = nl_req_get_iface_phy_idx(nl_global, iface_index)) < 0)
+            return -EINVAL;
+
+        nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+    }
 
     nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
 
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_init_channels, chan_status);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_init_channels, chan_status);
 
     return 0;
 }
 
-int nl_req_del_iface(const char *ifname)
+int nl_req_del_iface(struct nl_global_info *nl_global, const char *ifname)
 {
     struct nl_msg *msg;
     int err = 0;
     int phy_idx = -EINVAL;
     int iface_index = -EINVAL;
 
+    if (!nl_global)
+        return -EINVAL;
+
     if ((iface_index = util_sys_ifname_to_idx(ifname)) < 0)
         return -EINVAL;
 
-    if ((phy_idx = nl_req_get_iface_phy_idx(iface_index)) < 0)
+    if ((phy_idx = nl_req_get_iface_phy_idx(nl_global, iface_index)) < 0)
         return -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_DEL_INTERFACE, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_DEL_INTERFACE, false);
     nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
 
-    err = nlmsg_send_and_recv(&nl_global, msg, NULL, NULL);
+    err = nlmsg_send_and_recv(nl_global, msg, NULL, NULL);
 
     return err;
 }
 
-int nl_req_add_iface(const char *new_vif_name, const char *r_ifname, const char *mode, char *mac_addr)
+int nl_req_add_iface(struct nl_global_info *nl_global,
+                     const char *new_vif_name,
+                     const char *r_ifname,
+                     const char *mode, char *mac_addr)
 {
     struct nl_msg *msg;
     int err = 0;
@@ -389,23 +432,26 @@ int nl_req_add_iface(const char *new_vif_name, const char *r_ifname, const char 
     enum nl80211_iftype iftype;
     int iface_index = -EINVAL;
 
+    if (!nl_global)
+        return -EINVAL;
+
     if (mode_to_nl80211_attr_iftype(mode, &iftype) < 0)
         return -EINVAL;
 
     if ((iface_index = util_sys_ifname_to_idx(r_ifname)) < 0)
         return -EINVAL;
 
-    if ((phy_idx = nl_req_get_iface_phy_idx(iface_index)) < 0)
+    if ((phy_idx = nl_req_get_iface_phy_idx(nl_global, iface_index)) < 0)
         return -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_NEW_INTERFACE, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_NEW_INTERFACE, false);
     nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
     nla_put_u32(msg, NL80211_ATTR_IFTYPE, iftype);
     nla_put_string(msg, NL80211_ATTR_IFNAME, new_vif_name);
     nla_put(msg, NL80211_ATTR_MAC, MAC_ADDR_LEN, mac_addr);
     nla_put_flag(msg, NL80211_ATTR_IFACE_SOCKET_OWNER);
 
-    err = nlmsg_send_and_recv(&nl_global, msg, NULL, NULL);
+    err = nlmsg_send_and_recv(nl_global, msg, NULL, NULL);
 
     return err;
 }
@@ -425,22 +471,24 @@ int nl_resp_parse_iface_curr_chan(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-int nl_req_get_iface_curr_chan(const char *ifname)
+int nl_req_get_iface_curr_chan(struct nl_global_info *nl_global, int if_index)
 {
     int curr_chan = 0;
-    int if_index;
     struct nl_msg *msg;
 
-    if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
+    if (!nl_global)
         return -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    if (if_index < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_INTERFACE, false);
     if (!msg)
         return -ENOMEM;
 
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
 
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_iface_curr_chan, &curr_chan);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_iface_curr_chan, &curr_chan);
 
     return curr_chan;
 }
@@ -489,47 +537,48 @@ int nl_resp_parse_iface_supp_chan(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-int nl_req_get_iface_supp_chan(const char *ifname)
+int nl_req_get_iface_supp_chan(struct nl_global_info *nl_global, const char *ifname)
 {
     struct nl_msg *msg;
     int channel = -EINVAL;
     int phy_idx = -EINVAL;
     int iface_index = -EINVAL;
 
+    if (!nl_global)
+        return -EINVAL;
+
     if ((iface_index = util_sys_ifname_to_idx(ifname)) < 0)
         return -EINVAL;
 
-    if ((phy_idx = nl_req_get_iface_phy_idx(iface_index)) < 0)
+    if ((phy_idx = nl_req_get_iface_phy_idx(nl_global, iface_index)) < 0)
         return -EINVAL;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_WIPHY, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_WIPHY, false);
     if (!msg)
         return -ENOMEM;
 
     nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
 
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_iface_supp_chan, &channel);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_iface_supp_chan, &channel);
 
     return channel;
 }
 
-/* Naming template for set/get request and parsing of received messages
- * nl_req_set_x
- * nl_req_get_x
- * nl_resp_parse_x
- */
-int nl_req_set_reg_dom(char *country_code)
+int nl_req_set_reg_dom(struct nl_global_info *nl_global, char *country_code)
 {
     struct nl_msg *msg;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_REQ_SET_REG, false);
+    if (!nl_global)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_REQ_SET_REG, false);
     if (nla_put_string(msg, NL80211_ATTR_REG_ALPHA2, country_code)) {
         nlmsg_free(msg);
         LOGT("Failed to set country code");
         return -1;
     }
 
-    if (nlmsg_send_and_recv(&nl_global, msg, NULL, NULL))
+    if (nlmsg_send_and_recv(nl_global, msg, NULL, NULL))
         return -1;
 
     return 0;
@@ -557,14 +606,17 @@ int nl_resp_parse_reg_dom(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-int nl_req_get_reg_dom(char *buf)
+int nl_req_get_reg_dom(struct nl_global_info *nl_global, char *buf)
 {
     struct nl_msg *msg;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_REG, true);
+    if (!nl_global)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_REG, true);
     if (!msg) return -ENOMEM;
 
-    return nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_reg_dom, buf);
+    return nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_reg_dom, buf);
 }
 
 int nl_resp_parse_mode(struct nl_msg *msg, void *arg)
@@ -584,26 +636,35 @@ int nl_resp_parse_mode(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
-bool nl_req_get_mode(const char *ifname, char *mode, int len)
+bool nl_req_get_mode(struct nl_global_info *nl_global,
+                     const char *ifname,
+                     char *mode,
+                     int len)
 {
     int if_index = -EINVAL;
     int mode_type = -EINVAL;
     struct nl_msg *msg;
     enum nl80211_iftype type = NL80211_IFTYPE_UNSPECIFIED;
 
+    if (!nl_global)
+        return -EINVAL;
+
     if ((if_index = util_sys_ifname_to_idx(ifname)) < 0)
         return false;
 
-    msg = nlmsg_init(&nl_global, NL80211_CMD_GET_INTERFACE, false);
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_INTERFACE, false);
     if (!msg)
         return false;
 
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
-    nlmsg_send_and_recv(&nl_global, msg, nl_resp_parse_mode, &mode_type);
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_mode, &mode_type);
     type = mode_type;
 
     return util_mode(type, mode, len);
 }
+
+#if 0
+static ev_io            nl_ev_loop;
 
 static int nl_event_parse(struct nl_msg *msg, void *arg)
 {
@@ -678,37 +739,60 @@ static void nl_ev_handler(struct ev_loop *ev, struct ev_io *io, int event)
         LOGT("Failed to receive event message");
 }
 
-int netlink_global_init(struct ev_loop *loop)
+void netlink_mcast_event_register(struct nl_global_info *nl_global)
 {
-    if (netlink_init(&nl_global) < 0) {
+    add_mcast_subscription(nl_global, "config");
+    add_mcast_subscription(nl_global, "mlme");
+    add_mcast_subscription(nl_global, "vendor");
+
+    ev_io_init(&nl_ev_loop, nl_ev_handler, nl_socket_get_fd(nl_global.nl_evt_handle), EV_READ);
+    ev_io_start(loop, &nl_ev_loop);
+}
+#endif
+
+int netlink_global_init(struct nl_global_info *nl_global)
+{
+    if (!nl_global)
+        return -EINVAL;
+
+    if (netlink_init(nl_global) < 0) {
         LOGT("nl80211: failed to connect\n");
         return -1;
     }
 
-    if (!loop)
-        return -1;
-
-    add_mcast_subscription(&nl_global, "config");
-    add_mcast_subscription(&nl_global, "mlme");
-    add_mcast_subscription(&nl_global, "vendor");
-
-    ev_io_init(&nl_ev_loop, nl_ev_handler, nl_socket_get_fd(nl_global.nl_evt_handle), EV_READ);
-    ev_io_start(loop, &nl_ev_loop);
+    /* Can be used to register for netlink events */
+    //netlink_mcast_event_register(nl_global);
 
     return 0;
 }
 
-void netlink_global_deinit(void)
+void target_nl80211_init(struct nl_global_info *nl_global)
 {
-    nl_socket_free(nl_global.nl_msg_handle);
-    nl_socket_free(nl_global.nl_evt_handle);
-    nl_cb_put(nl_global.nl_cb);
-    nl_global.nl_cb = NULL;
+    if (!nl_global)
+        return;
+
+    netlink_global_init(nl_global);
+
+    return;
 }
 
-void target_nl80211_init(struct ev_loop *loop)
+void netlink_global_deinit(struct nl_global_info *nl_global)
 {
-    netlink_global_init(loop);
+    if (!nl_global)
+        return;
+
+    nl_socket_free(nl_global->nl_msg_handle);
+    nl_socket_free(nl_global->nl_evt_handle);
+    nl_cb_put(nl_global->nl_cb);
+    nl_global->nl_cb = NULL;
+}
+
+void target_nl80211_deinit(struct nl_global_info *nl_global)
+{
+    if (!nl_global)
+        return;
+
+    netlink_global_deinit(nl_global);
 
     return;
 }

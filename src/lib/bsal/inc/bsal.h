@@ -28,6 +28,35 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define BSAL_H_INCLUDED
 #include "target_bsal.h"
 
+enum xing_level {
+    SNR_NONE,
+    SNR_ABOVE_HWM,
+    SNR_BETWEEN_HWM_LWM,
+    SNR_BELOW_LWM
+};
+
+typedef struct {
+    os_macaddr_t            mac_addr;
+    char                    ifname[IFNAMSIZ];
+    bool                    connected;
+    uint8_t                 is_BTM_supported;
+    uint8_t                 is_RRM_supported;
+    bool                    band_cap_2G;
+    bool                    band_cap_5G;
+    bsal_datarate_info_t    datarate_info;
+    bsal_rrm_caps_t         rrm_caps;
+    uint8_t                 assoc_ies[BSAL_MAX_ASSOC_IES_LEN];
+    uint16_t                assoc_ies_len;
+    uint8_t                 rssi;
+    uint8_t                 snr;
+    uint64_t                tx_bytes;
+    uint64_t                rx_bytes;
+    uint8_t                 snr_lwm_xing;
+    uint8_t                 snr_hwm_xing;
+    enum xing_level         xing_level;
+    ds_dlist_node_t         node;
+} bsal_cli_info;
+
 int     nl_bsal_init(bsal_event_cb_t event_cb, struct ev_loop *loop);
 int     nl_bsal_cleanup(void);
 
@@ -50,4 +79,5 @@ int     nl_bsal_rrm_set_neighbor(const char *ifname, const bsal_neigh_info_t *nr
 int     nl_bsal_rrm_remove_neighbor(const char *ifname, const bsal_neigh_info_t *nr);
 int     nl_bsal_send_action(const char *ifname, const uint8_t *mac_addr, const uint8_t *data, unsigned int data_len);
 
+void    bsal_nl_evt_parse_conn_failed(struct nlattr **tb);
 #endif /* BSAL_H_INCLUDED */

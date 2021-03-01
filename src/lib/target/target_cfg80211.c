@@ -81,8 +81,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  * GLOBALS
  *****************************************************************************/
 
-#define CHAN_SWITCH_DEFAULT_CS_COUNT 15
-
 #define HOME_AP_PREFIX  "home-ap"
 #define HOME_AP_24      "home-ap-24"
 #define BHAUL_AP_24     "bhaul-ap-24"
@@ -92,7 +90,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define UTIL_CB_KV_KEY      "delayed_update_ifname_list"
 #define UTIL_CB_DELAY_SEC   1
 
-static ev_timer g_util_cb_timer;
+struct nl_global_info   target_nl_global;
+static ev_timer         g_util_cb_timer;
 
 static int      util_nl_fd = -1;
 static ev_io    util_nl_io;
@@ -419,7 +418,7 @@ void ht_mode_to_mode(const struct schema_Wifi_Radio_Config *rconf, char *mode, i
     if (!rconf->hw_mode_exists) return;
 
     if (!strcmp(rconf->hw_mode, "11ac"))
-        strscpy(mode, "vht", mode_len);
+        strscpy(mode, "ht vht", mode_len);
     if (!strcmp(rconf->hw_mode, "11n"))
         strscpy(mode, "ht", mode_len);
 
@@ -974,7 +973,7 @@ util_get_phy_chan(const char *phy,
         return false;
     }
 
-    *chan = nl_req_get_iface_curr_chan(ap_vif);
+    *chan = nl_req_get_iface_curr_chan(&target_nl_global, util_sys_ifname_to_idx(ap_vif));
     if (*chan > 0)
         return true;
 
@@ -985,7 +984,7 @@ static bool
 util_get_vif_chan(const char *vif,
                   int *chan)
 {
-    *chan = nl_req_get_iface_curr_chan(vif);
+    *chan = nl_req_get_iface_curr_chan(&target_nl_global, util_sys_ifname_to_idx(vif));
 
     if (*chan <= 0)
         return false;
@@ -1010,7 +1009,7 @@ util_get_vif_chan(const char *vif,
 static int
 util_get_opmode(const char *vif, char *opmode, int len)
 {
-    if (nl_req_get_mode(vif, opmode, len) == true)
+    if (nl_req_get_mode(&target_nl_global, vif, opmode, len) == true)
         return 1;
 
     LOGW("%s: failed to get opmode", vif);
@@ -1039,7 +1038,7 @@ util_any_phy_vif_type(const char *phy, const char *type, char *buf, int len)
 static void
 util_set_tx_power(const char *phy, const int tx_power_dbm)
 {
-    nl80211_set_txpwr(phy, tx_power_dbm);
+    nl_req_set_txpwr(&target_nl_global, phy, tx_power_dbm);
     return;
 }
 
@@ -1050,11 +1049,11 @@ util_get_tx_power(const char *phy)
     int txpwr = 0;
 
     if (util_wifi_get_phy_any_ap_vif(phy, ap_vif, sizeof(ap_vif))) {
-        LOGE("%s: get ap vif failed", phy);
+        LOGD("%s: get ap vif failed", phy);
         return 0;
     }
 
-    txpwr = nl80211_get_txpwr(ap_vif);
+    txpwr = nl_req_get_txpwr(&target_nl_global, ap_vif);
     if (txpwr < 0)
         return 0;
 
@@ -1313,12 +1312,16 @@ hapd_sta_disconnected(struct hapd *hapd, const char *mac)
 static void
 hapd_ap_enabled(struct hapd *hapd)
 {
+    util_cb_vif_state_update(hapd->ctrl.bss);
+    util_cb_phy_state_update(hapd->phy);
     hapd_sta_regen(hapd);
 }
 
 static void
 hapd_ap_disabled(struct hapd *hapd)
 {
+    util_cb_vif_state_update(hapd->ctrl.bss);
+    util_cb_phy_state_update(hapd->phy);
     hapd_sta_regen(hapd);
 }
 
@@ -1370,6 +1373,8 @@ hapd_ctrl_closed(struct ctrl *ctrl)
 {
     struct hapd *hapd = container_of(ctrl, struct hapd, ctrl);
     hapd_sta_regen(hapd);
+    unlink(hapd->confpath);
+    unlink(hapd->pskspath);
 }
 
 static void
@@ -1519,6 +1524,8 @@ static void hapd_dfs_event_radar_detected(struct hapd *hapd, const char *event)
             chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
         if (chan_list)
             dfs_update_chan_state(hapd, chan_list, NOP_STARTED);
+
+        util_kv_radar_set(hapd->phy, chan);
     }
 
     return;
@@ -1534,7 +1541,7 @@ static void hapd_dfs_event_nop_finished(struct hapd *hapd, const char *event)
     const int   *chan_list = NULL;
     char        *parse_buf = strdupa(event);
 
-    // DFS_EVENT_NOP_FINISHED freq=5580 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5610 cf2=0
+    // DFS-NOP-FINISHED freq=5580 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5610 cf2=0
     while ((kv = strsep(&parse_buf, " "))) {
         if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
             if (!strcmp(k, "freq"))
@@ -1544,7 +1551,7 @@ static void hapd_dfs_event_nop_finished(struct hapd *hapd, const char *event)
         }
     }
     if (chan) {
-        LOGI("%s: event[DFS_EVENT_NOP_FINISHED %s]", __func__, event);
+        LOGI("%s: event[DFS-NOP-FINISHED %s]", __func__, event);
         if (cf1)
             chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
         if (chan_list)
@@ -1641,6 +1648,7 @@ hostap_ctrl_destroy(const char *bss)
 {
     struct hapd *hapd = hapd_lookup(bss);
     struct wpas *wpas = wpas_lookup(bss);
+
     if (hapd) hapd_destroy(hapd);
     if (wpas) wpas_destroy(wpas);
 }
@@ -1699,93 +1707,9 @@ hostap_ctrl_apply(const char *bss,
         LOGI("%s: failed to apply config", bss);
 }
 
-/******************************************************************************
- * hostapd helpers
- *****************************************************************************/
+/******************************************************************************/
 
-int hostapd_mac_acl_clear(const char *phy, const char *vif)
-{
-    char hostapd_cmd[1024];
-    bool status;
-
-    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-        "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
-        "ACCEPT_ACL CLEAR",
-        HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
-
-    status = !cmd_log(hostapd_cmd);
-    if (!status)
-        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
-
-    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-        "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
-        "DENY_ACL CLEAR",
-        HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
-
-    status = !cmd_log(hostapd_cmd);
-    if (!status)
-        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
-
-    return 0;
-}
-
-bool hostapd_mac_acl_accept_add(const char *phy, const char *vif, const char *mac_list_buf)
-{
-    char hostapd_cmd[1024];
-    bool ret = true;
-    bool status;
-    char *mac;
-    char *p;
-
-    hostapd_mac_acl_clear(phy, vif);
-
-    for_each_mac(mac, (p = strdup(mac_list_buf))) {
-        snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
-            "ACCEPT_ACL ADD_MAC %s",
-            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac);
-
-        status = !cmd_log(hostapd_cmd);
-        if (!status) {
-            ret = false;
-            LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
-        }
-    }
-
-    free(p);
-
-    return ret;
-}
-
-bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_list_buf)
-{
-    char hostapd_cmd[1024];
-    bool ret = true;
-    bool status;
-    char *mac;
-    char *p;
-
-    hostapd_mac_acl_clear(phy, vif);
-
-    for_each_mac(mac, (p = strdup(mac_list_buf))) {
-        snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s "
-            "DENY_ACL ADD_MAC %s",
-            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac);
-
-        status = !cmd_log(hostapd_cmd);
-        if (!status) {
-            ret = false;
-            LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
-        }
-    }
-
-    free(p);
-
-    return ret;
-}
-
-int util_hostapd_acl_update(char *phy, char *vif, const char *mac_list_type, char *mac_list_buf)
+static int util_hostapd_acl_update(char *phy, char *vif, const char *mac_list_type, char *mac_list_buf)
 {
     if (strstr(vif, "sta"))
         return false;
@@ -1798,93 +1722,36 @@ int util_hostapd_acl_update(char *phy, char *vif, const char *mac_list_type, cha
         return hostapd_mac_acl_clear(phy, vif);
 }
 
-bool util_hostapd_get_mac_acl(const char *phy,
-                         const char *vif,
-                         struct schema_Wifi_VIF_State *vstate)
-{
-    char *accept_buf = NULL;
-    char *deny_buf = NULL;
-    char *buf = NULL;
-    char sockdir[64];
-    char *line;
-    char *mac_addr;
-
-    if (strstr(vif, "sta"))
-        return false;
-
-    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
-
-    accept_buf = HOSTAPD_CLI(sockdir, vif, "ACCEPT_ACL", "SHOW");
-
-    deny_buf = HOSTAPD_CLI(sockdir, vif, "DENY_ACL", "SHOW");
-
-    if ((deny_buf && (strlen(deny_buf) > 0)) && (!accept_buf || !strlen(accept_buf)))
-        STRSCPY(vstate->mac_list_type, "blacklist");
-    else if ((accept_buf && (strlen(accept_buf)) > 0) && (!deny_buf || !strlen(deny_buf)))
-        STRSCPY(vstate->mac_list_type, "whitelist");
-    else
-        return false;
-
-    if (strlen(deny_buf) > 0)
-        buf = strdupa(deny_buf);
-    else
-        buf = strdupa(accept_buf);
-
-    while (line = strsep(&buf, "\n"))
-        if (mac_addr = strsep(&line, " "))
-            if (strlen(mac_addr) > 0) {
-                STRSCPY(vstate->mac_list[vstate->mac_list_len], mac_addr);
-                vstate->mac_list_len++;
-            }
-
-    return true;
-}
-
-bool util_hostapd_get_hw_mode(const char *phy, char *buf, int buf_len)
+static bool util_hostapd_get_hw_mode(const char *phy, char *buf, int buf_len)
 {
     char ap_vif[32] = {};
-    char sockdir[64];
-    char *bss_status;
-    const char *k;
-    const char *v;
-    char *kv;
-    int is_11n = 0;
-    int is_11ac = 0;
-    int is_11ax = 0;
 
     if (util_wifi_get_phy_any_ap_vif(phy, ap_vif, sizeof(ap_vif))) {
         LOGE("%s: get ap vif failed", phy);
         return false;
     }
 
-    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
+    return hostapd_status_get_hw_mode(phy, ap_vif, buf, buf_len);
+}
 
-    bss_status = HOSTAPD_CLI(sockdir, ap_vif, "STATUS");
-    if (!bss_status || (!strlen(bss_status)))
+static bool util_get_bcn_int(const char *phy, int *val)
+{
+    char ap_vif[BFR_SIZE_64] = "";
+    char sockdir[64] = "";
+    char *bss_status;
+    const char *k;
+    const char *v;
+    char *kv;
+
+    if (util_wifi_get_phy_any_ap_vif(phy, ap_vif, sizeof(ap_vif))) {
+        LOGD("%s: get ap vif failed", phy);
         return false;
-
-    while ((kv = strsep(&bss_status, "\r\n"))) {
-        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
-            if (!strcmp(k, "ieee80211n"))
-                is_11n = atoi(v);
-            if (!strcmp(k, "ieee80211ac"))
-                is_11ac = atoi(v);
-            if (!strcmp(k, "ieee80211ax"))
-                is_11ax = atoi(v);
-        }
     }
 
-    if (is_11ax)
-        strscpy(buf, "11ax", buf_len);
-    else if (is_11ac)
-        strscpy(buf, "11ac", buf_len);
-    else if (is_11n)
-        strscpy(buf, "11n", buf_len);
-    else
-        return false;
-
-    return true;
+    return hostapd_status_get_bcn_int(phy, ap_vif, val);
 }
+
+/******************************************************************************/
 
 static int
 util_get_mode(const char *hwmode,
@@ -1915,25 +1782,6 @@ util_set_int_lazy(const char *device_ifname,
 
     LOGI("%s: setting '%s' = %d", device_ifname, param_set, v);
     return util_set_int(device_ifname, param_set, v);
-}
-
-static bool
-util_get_bcn_int(const char *phy, int *v)
-{
-    char *vif;
-    int err;
-
-    err = util_wifi_any_phy_vif(phy, vif = A(32));
-    if (err)
-        return false;
-
-    return util_get_int(vif, "get_bintval", v);
-}
-
-static bool
-util_get_ht_mode(const char *vif, char *htmode, int htmode_len)
-{
-    return nl_req_get_ht_mode(vif, htmode, htmode_len);
 }
 
 /******************************************************************************
@@ -2269,13 +2117,11 @@ target_bsal_iface_add(const bsal_ifconfig_t *ifcfg)
     return nl_bsal_iface_add(ifcfg);
 }
 
-#if 0
 int
 target_bsal_iface_update(const bsal_ifconfig_t *ifcfg)
 {
     return nl_bsal_iface_update(ifcfg);
 }
-#endif
 
 int
 target_bsal_iface_remove(const bsal_ifconfig_t *ifcfg)
@@ -2589,7 +2435,7 @@ util_radio_channel_list_get(const char *phy, struct schema_Wifi_Radio_State *rst
     char    buffer[BFR_SIZE_4K] = "";
     char    *buf = buffer;
 
-    if (nl_req_get_channels(phy, buffer, sizeof(buffer)) < 0)
+    if (nl_req_get_channels(&target_nl_global, phy, buffer, sizeof(buffer)) < 0)
         LOGW("%s: failed to fetch channel information", __func__);
 
     while ((line = strsep(&buf, "\n")) != NULL) {
@@ -2661,7 +2507,7 @@ util_radio_ht_mode_get(char *phy, char *htmode, int htmode_len)
         return false;
     }
 
-    return util_get_ht_mode(ap_vif, htmode, htmode_len);
+    return nl_req_get_ht_mode(&target_nl_global, ap_vif, htmode, htmode_len);
 }
 
 static bool
@@ -2672,7 +2518,7 @@ util_radio_country_get(const char *phy, char *country, int country_len)
     int err;
 
     memset(country, '\0', country_len);
-    if ((err = nl_req_get_reg_dom(buf)) < 0) {
+    if ((err = nl_req_get_reg_dom(&target_nl_global, buf)) < 0) {
         LOGW("%s: failed to get country: %d", phy, err);
         return false;
     }
@@ -2845,10 +2691,9 @@ util_hw_config_set(const struct schema_Wifi_Radio_Config *rconf)
     LOGT("%s: hw_config is not supported", __func__);
 }
 
-int hapd_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char *phy, const char *vif)
+int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char *phy, const char *vif)
 {
     int     width;
-    bool    status;
     char    mode[BFR_SIZE_32] = "";
     char    opt_chan_info[BFR_SIZE_64] = "";
     int     sec_chan_offset;
@@ -2856,7 +2701,6 @@ int hapd_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
     int     center_chan;
     int     center_freq1;
     char    center_freq1_str[BFR_SIZE_64] = "";
-    char    hostapd_cmd[BFR_SIZE_1K] = "";
     char    curr_htmode[BFR_SIZE_32] = "";
     int     curr_chan = 0;
 
@@ -2871,11 +2715,6 @@ int hapd_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
         }
     }
 
-    if (g_chan_status[rconf->channel].state == CAC_STARTED) {
-        LOGN("%s: cac in progress on channel %d", __func__, rconf->channel);
-        return -1;
-    }
-
     sec_chan_offset = get_sec_chan_offset(rconf);
     if (sec_chan_offset != -EINVAL)
         snprintf(sec_chan_offset_str, sizeof(sec_chan_offset_str), "sec_channel_offset=%d", sec_chan_offset);
@@ -2885,7 +2724,7 @@ int hapd_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
     if (!ht_mode_to_bw(rconf, &width))
         snprintf(opt_chan_info, sizeof(opt_chan_info), "bandwidth=%d %s", width, mode);
 
-    if ((width > 20) || (!strcmp(mode, "vht"))) {
+    if ((width > 20) || (strstr(mode, "vht"))) {
         if ((center_chan = unii_5g_centerfreq(rconf->ht_mode, rconf->channel)) > 0) {
             center_freq1 = util_chan_to_freq(center_chan);
             if (center_freq1)
@@ -2893,24 +2732,7 @@ int hapd_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
         }
     }
 
-    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s CHAN_SWITCH %d %d %s %s %s",
-            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
-            CHAN_SWITCH_DEFAULT_CS_COUNT,
-            util_chan_to_freq(rconf->channel),
-            strlen(center_freq1_str) ? center_freq1_str : "",
-            strlen(sec_chan_offset_str) ? sec_chan_offset_str : "",
-            strlen(opt_chan_info) ? opt_chan_info : "");
-
-    LOGI("%s: %s", __func__, hostapd_cmd);
-
-    status = !cmd_log(hostapd_cmd);
-    if (!status) {
-        LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
-        return -1;
-    }
-
-    return 0;
+    return hostapd_chan_switch(phy, vif, rconf->channel, center_freq1_str, sec_chan_offset_str, opt_chan_info);
 }
 
 bool
@@ -2923,7 +2745,7 @@ target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
     if ((changed->channel || changed->ht_mode)) {
         if (rconf->channel_exists && rconf->channel > 0 && rconf->ht_mode_exists) {
             if ((vif = util_any_phy_vif_type(phy, "ap", A(32)))) {
-                if (hapd_channel_switch(rconf, phy, vif) < 0)
+                if (util_channel_switch(rconf, phy, vif) < 0)
                     LOGN("%s: error received while trying to set new channel/ht_mode", __func__);
             } else {
                 LOGI("%s: no ap vaps, channel %d will be set on first vap if possible",
@@ -3051,7 +2873,13 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 
         if (access(F("/sys/class/net/%s", vif), X_OK) == 0) {
             LOGI("%s: deleting netdev", vif);
-            nl_req_del_iface(vif);
+            /* Sync the DFS channel states with the driver
+             * If a channel is in cac_started state and the interface is deleted, then we will not get
+             * further events like DFS-CAC-COMPLETED from hostapd for this channel and the channel will
+             * always remain in cac_started state.
+             */
+            nl_req_init_channels(&target_nl_global, vif, g_chan_status);
+            nl_req_del_iface(&target_nl_global, vif);
             util_vif_config_athnewind(phy);
         }
 
@@ -3070,7 +2898,7 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
              macaddr[3], macaddr[4], macaddr[5],
              rconf->channel_exists ? rconf->channel : 0);
 
-        nl_req_add_iface(vif, phy, vconf->mode, macaddr);
+        nl_req_add_iface(&target_nl_global, vif, phy, vconf->mode, macaddr);
 
         hostap_ctrl_discover(vif);
 
@@ -3224,7 +3052,7 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
     if ((vstate->mcast2ucast_exists = util_get_int(vif, "g_mcastenhance", &v)))
         vstate->mcast2ucast = !!v;
 
-    vstate->mac_list_type_exists = util_hostapd_get_mac_acl(phy, vif, vstate);
+    vstate->mac_list_type_exists = hostapd_get_mac_acl_info(phy, vif, vstate);
 
     if ((vstate->mac_exists = (0 == util_net_get_macaddr_str(vif, buf, sizeof(buf)))))
         STRSCPY(vstate->mac, buf);
@@ -3324,9 +3152,12 @@ target_radio_init(const struct target_radio_ops *ops)
 
     target_radio_config_init_check_runtime();
 
-    target_nl80211_init(NULL);
+    if (target_nl80211_init(&target_nl_global)) {
+        LOGE("%s: failed to initialize netlink info", __func__);
+        return false;
+    }
 
-    if (wiphy_info_init()) {
+    if (wiphy_info_init(&target_nl_global)) {
         LOGE("%s: failed to initialize wiphy info", __func__);
         return false;
     }
@@ -3351,7 +3182,21 @@ target_radio_init(const struct target_radio_ops *ops)
     g_rconfs = ovsdb_table_select_where(&table_Wifi_Radio_Config, NULL, &g_num_rconfs);
     g_vconfs = ovsdb_table_select_where(&table_Wifi_VIF_Config, NULL, &g_num_vconfs);
 
-    nl_req_init_channels(g_chan_status);
+    /* We need to rely on both netlink and hostapd events to track the DFS channel states
+     * DFS states for channels that can be queried from driver - see nl80211_dfs_state:
+     * NL80211_DFS_USABLE       -> OpenSync state NOP_FINISHED
+     * NL80211_DFS_AVAILABLE    -> OpenSync state CAC_COMPLETED
+     * NL80211_DFS_UNAVAILABLE  -> OpenSync state NOP_STARTED
+     * DFS channel states from hostapd events:
+     * DFS_EVENT_CAC_START      -> OpenSync state CAC_STARTED (CAC procedure started)
+     * DFS_EVENT_CAC_COMPLETED  -> OpenSync state CAC_COMPLETED (CAC procedure completed)
+     * DFS_EVENT_RADAR_DETECTED -> OpenSync state NOP_STARTED (Non occupancy period (NOP)
+                                   active, making the channel unavailable)
+     * DFS_EVENT_NOP_FINISHED   -> OpenSync state NOP_FINISHED (NOP is over,
+                                   making the channel available again)
+     * Any non-DFS channel      -> OpenSync state ALLOWED (channel available without restrictions)
+     */
+    nl_req_init_channels(&target_nl_global, NULL, g_chan_status);
 
 #if defined(AP_STA_CONNECTED_PWD)
 #error "Legacy multi-psk hostapd patches not supported. Use upstream patches."

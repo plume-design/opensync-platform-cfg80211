@@ -198,13 +198,14 @@ chan_get_band_str(int flags)
 }
 
 static int
-identify_band_wlanconfig2(const char *phyname,
-                      const char **band)
+identify_band_wlanconfig2(struct nl_global_info *nl_global,
+                          const char *phyname,
+                          const char **band)
 {
     int flags = 0;
     int chan = -EINVAL;
 
-    if ((chan = nl_req_get_iface_supp_chan(phyname)) > 0) {
+    if ((chan = nl_req_get_iface_supp_chan(nl_global, phyname)) > 0) {
         chan_classify(chan, &flags);
         *band = chan_get_band_str(flags);
     }
@@ -213,12 +214,13 @@ identify_band_wlanconfig2(const char *phyname,
 }
 
 static int
-identify_band(const char *phyname,
+identify_band(struct nl_global_info *nl_global,
+              const char *phyname,
               const char **band)
 {
     int err;
 
-    err = identify_band_wlanconfig2(phyname, band);
+    err = identify_band_wlanconfig2(nl_global, phyname, band);
 
     return err;
 }
@@ -273,7 +275,7 @@ wiphy_get_idx(const char *phyname)
 }
 
 static int
-wiphy_info_init_ifname(const char *phyname)
+wiphy_info_init_ifname(struct nl_global_info *nl_global, const char *phyname)
 {
     struct wiphy_info *info;
     int idx;
@@ -286,19 +288,13 @@ wiphy_info_init_ifname(const char *phyname)
 
     if (WARN_ON(identify_chip(phyname, &info->chip, &info->codename)))
         return -1;
-    if (WARN_ON(identify_band(phyname, &info->band)))
+    if (WARN_ON(identify_band(nl_global, phyname, &info->band)))
         return -1;
 
-#if 0
-    // TODO
-    if (WARN_ON(identify_max_width(phyname, &info->max_width)))
-        return -1;
-#endif
     if (WARN_ON(!info->band))
         return -1;
 
-    //TODO
-    info->mode = "11ax";
+    info->mode = "11ac";
 
     if (!strcmp(info->band, "2.4G"))
         STRSCPY(g_wiphy_2ghz_ifname, phyname);
@@ -332,17 +328,12 @@ wiphy_info_get(const char *ifname)
         return NULL;
     if (WARN_ON(!info->mode))
         return NULL;
-#if 0
-    // TODO
-    if (WARN_ON(!info->max_width))
-        return NULL;
-#endif
 
     return info;
 }
 
 int
-wiphy_info_init(void)
+wiphy_info_init(struct nl_global_info *nl_global)
 {
     struct dirent *i;
     DIR *d;
@@ -352,7 +343,7 @@ wiphy_info_init(void)
 
     while ((i = readdir(d)))
         if (strstr(i->d_name, wiphy_prefix) == i->d_name)
-            if (WARN_ON(wiphy_info_init_ifname(i->d_name)))
+            if (WARN_ON(wiphy_info_init_ifname(nl_global, i->d_name)))
                 break;
 
     closedir(d);

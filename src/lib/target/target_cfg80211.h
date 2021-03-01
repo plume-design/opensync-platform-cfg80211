@@ -42,8 +42,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
             int err = util_exec_read(rtrimnl, buf, sizeof(buf), __VA_ARGS__); \
             err || strcmp(str, buf); \
         })
-#define for_each_mac(mac, list) \
-    for (mac = strtok(list, " \t\n"); mac; mac = strtok(NULL, " \t\n")) \
 
 static inline bool util_get_int(const char *ifname, const char *param_name, int *v)
 {

@@ -77,9 +77,12 @@ int nl_resp_parse_mcast_id(struct nl_msg *msg, void *arg)
 /* Add multicast subscription */
 int add_mcast_subscription(struct nl_global_info *nl_global, char *name)
 {
-    struct nl_msg *msg;
+    struct nl_msg *msg = NULL;
     struct mcast_group_id grp_id = { name, -EINVAL };
     int ret = -EINVAL;
+
+    if (!nl_global)
+        return ret;
 
     msg = nlmsg_alloc();
     if (!msg)
@@ -143,15 +146,23 @@ int nlmsg_send_and_recv(struct nl_global_info *nl_global,
                         int (*handler) (struct nl_msg *, void *),
                         void *arg)
 {
-    struct nl_cb *cb;
-    int err;
-    int ret;
+    struct nl_cb *cb = NULL;
+    int err = -1;
 
     if (!msg)
         return -ENOMEM;
 
+    if (!nl_global)
+        goto out;
+
+    if (nl_global->nl_cb == NULL)
+        goto out;
+
     cb = nl_cb_clone(nl_global->nl_cb);
     if (!cb)
+        goto out;
+
+    if (nl_global->nl_msg_handle == NULL)
         goto out;
 
     set_options(nl_global->nl_msg_handle);
@@ -168,11 +179,9 @@ int nlmsg_send_and_recv(struct nl_global_info *nl_global,
     if (handler)
         nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, handler, arg);
 
-    while (err > 0) {
-        ret = nl_recvmsgs(nl_global->nl_msg_handle, cb);
-        if (ret < 0)
-            LOGI("%s: nl_recvmsgs failed: %d (%s)", __func__, ret, nl_geterror(ret));
-    }
+    while (err > 0)
+        nl_recvmsgs(nl_global->nl_msg_handle, cb);
+
 out:
     nlmsg_free(msg);
     nl_cb_put(cb);
@@ -182,8 +191,11 @@ out:
 /* Initialize netlink message with netlink headers */
 struct nl_msg *nlmsg_init(struct nl_global_info *nl_global, int cmd, int dump)
 {
-    struct nl_msg *msg;
+    struct nl_msg *msg = NULL;
     int flags = 0;
+
+    if (!nl_global)
+        goto out;
 
     msg = nlmsg_alloc();
     if (!msg)
@@ -200,10 +212,12 @@ out:
 
 int netlink_init(struct nl_global_info *nl_global)
 {
-    nl_global->nl_cb = nl_cb_alloc(NL_CB_CUSTOM);
-    if (nl_global->nl_cb == NULL) {
+    if (!nl_global)
         return -1;
-    }
+
+    nl_global->nl_cb = nl_cb_alloc(NL_CB_CUSTOM);
+    if (nl_global->nl_cb == NULL)
+        return -1;
 
     /* Socket handler for messages */
     nl_global->nl_msg_handle = nl_socket_alloc_cb(nl_global->nl_cb);

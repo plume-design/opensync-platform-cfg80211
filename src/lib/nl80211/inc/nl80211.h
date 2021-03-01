@@ -115,6 +115,11 @@ typedef struct ssid_list {
         ds_dlist_node_t node;
 } ssid_list_t;
 
+struct noise_info {
+    int chan;
+    int noise;
+};
+
 int add_mcast_subscription(struct nl_global_info *nl_global, char *name);
 int nlmsg_send_and_recv(struct nl_global_info *nl_global,
                         struct nl_msg *msg,
