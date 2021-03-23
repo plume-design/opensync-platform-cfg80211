@@ -493,7 +493,7 @@ static void nl80211_cmd_frame_event(struct hapd *hapd, const char *in_buf)
         while ((kv = strsep(&parse_buf, " ")))
             if ((k = strsep(&kv, "=")) && (v = strsep(&kv, "")))
                 if (!strcmp(k, "buf")) {
-                    strscpy(assoc_frame, v, sizeof(assoc_frame));
+                    STRSCPY(assoc_frame, v);
                     bsal_process_assoc_req_frame(hapd->ctrl.bss, assoc_frame, reassoc);
                 }
 }
@@ -1047,7 +1047,7 @@ void bsal_nl_evt_parse_conn_failed(struct nlattr **tb)
     event.data.auth_fail.reason = 1; /* Unspecified */
 
     if (tb[NL80211_ATTR_IFNAME])
-        strncpy(event.ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
+        strscpy(event.ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
 
     reason = nla_get_u32(tb[NL80211_ATTR_CONN_FAILED_REASON]);
     switch (reason) {

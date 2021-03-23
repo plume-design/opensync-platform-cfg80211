@@ -469,7 +469,7 @@ int get_sec_chan_offset(const struct schema_Wifi_Radio_Config *rconf)
 
 char *chan_state_to_str(enum channel_state state)
 {
-    switch(state) {
+    switch (state) {
         case ALLOWED:
             return "ALLOWED";
         case CAC_STARTED:
@@ -1619,6 +1619,7 @@ hostap_ctrl_discover(const char *bss)
         hapd->ieee80211n = 1;
         hapd->ieee80211ac = 1;
         hapd->ieee80211ax = 0;
+        hapd->noscan = 1;
         util_radio_country_get(phy, hapd->country, sizeof(hapd->country));
         ctrl_enable(&hapd->ctrl);
         hapd = NULL;

@@ -40,9 +40,9 @@ int util_get_temp_info(const char *ifname)
 
     if (strcmp(ifname, "wlan0") == 0)
         snprintf(path_temp, sizeof(path_temp), "/sys/class/net/%s/device/hwmon/hwmon0/temp1_input", ifname);
-    else if(strcmp(ifname, "wlan1") == 0)
+    else if (strcmp(ifname, "wlan1") == 0)
         snprintf(path_temp, sizeof(path_temp), "/sys/class/net/%s/device/hwmon/hwmon1/temp1_input", ifname);
-    else if(strcmp(ifname, "wlan2") == 0)
+    else if (strcmp(ifname, "wlan2") == 0)
         snprintf(path_temp, sizeof(path_temp), "/sys/class/net/%s/device/hwmon/hwmon2/temp1_input", ifname);
     else
         return -EINVAL;

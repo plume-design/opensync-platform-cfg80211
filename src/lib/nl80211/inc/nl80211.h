@@ -120,6 +120,14 @@ struct noise_info {
     int noise;
 };
 
+struct nl80211_scan {
+    char name[IFNAMSIZ];
+    target_scan_cb_t *scan_cb;
+    void *scan_ctx;
+    struct avl_node avl;
+    ev_async async;
+};
+
 int add_mcast_subscription(struct nl_global_info *nl_global, char *name);
 int nlmsg_send_and_recv(struct nl_global_info *nl_global,
                         struct nl_msg *msg,
@@ -136,15 +144,5 @@ int mode_to_nl80211_attr_iftype(const char *mode, enum nl80211_iftype *type);
 int util_ht_mode(enum nl80211_chan_width chanwidth, char *ht_mode, int len);
 bool util_mode(enum nl80211_iftype type, char *mode, int len);
 int util_get_temp_info(const char *ifname);
-extern int nl80211_get_tx_chainmask(char *name, unsigned int *mask);
-extern int nl80211_get_ssid(struct nl_call_param *nl_call_param);
-extern int nl80211_get_assoclist(struct nl_call_param *nl_call_param);
-extern int nl80211_get_survey(struct nl_call_param *nl_call_param);
-extern int nl80211_scan_trigger(char *, uint32_t *, uint32_t,
-                                int, radio_scan_type_t,
-                                target_scan_cb_t *, void *);
-extern int nl80211_scan_abort(char *);
-extern int nl80211_scan_dump(struct nl_call_param *nl_call_param);
-int sm_stats_nl80211_init(void);
-
+int nl_sm_init(struct ev_loop *sm_evloop);
 #endif /* NL80211_H_INCLUDED */

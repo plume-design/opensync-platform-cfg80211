@@ -24,11 +24,13 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdio.h>
 #include <errno.h>
 
 #include "target.h"
+#include "nl80211.h"
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
 
@@ -42,5 +44,12 @@ struct ev_loop *target_mainloop;
 bool target_init(target_init_opt_t opt, struct ev_loop *loop)
 {
     target_mainloop = loop;
+    if (opt == TARGET_INIT_MGR_SM) {
+        if (nl_sm_init(loop) < 0) {
+            LOGE("%s: Initializing SM (Failed to init)",__func__);
+            return false;
+        }
+        LOGI("%s: sm event loop initialized", __func__);
+    }
     return true;
 }

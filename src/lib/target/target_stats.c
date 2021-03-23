@@ -127,12 +127,12 @@ bool target_stats_clients_get(radio_entry_t *radio_cfg,
 {
     bool ret;
 
-    ret = nl80211_stats_clients_get(radio_cfg,
-                                    essid,
-                                    client_cb,
-                                    client_list,
-                                    client_ctx);
-    if(true != ret)
+    ret = nl_stats_clients_get(radio_cfg,
+                               essid,
+                               client_cb,
+                               client_list,
+                               client_ctx);
+    if (true != ret)
     {
         (*client_cb)(client_list, client_ctx, false);
         return false;
@@ -174,13 +174,13 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg,
 {
     bool ret;
 
-    ret = nl80211_stats_survey_get(radio_cfg,
-                                   chan_list,
-                                   chan_num,
-                                   scan_type,
-                                   survey_cb,
-                                   survey_list,
-                                   survey_ctx);
+    ret = nl_stats_survey_get(radio_cfg,
+                              chan_list,
+                              chan_num,
+                              scan_type,
+                              survey_cb,
+                              survey_list,
+                              survey_ctx);
     if (true != ret)
     {
         (*survey_cb)(survey_list, survey_ctx, false);
@@ -217,19 +217,19 @@ bool target_stats_scan_start(radio_entry_t *radio_cfg,
                              target_scan_cb_t *scan_cb,
                              void *scan_ctx)
 {
-    return nl80211_stats_scan_start(radio_cfg,
-                                    chan_list,
-                                    chan_num,
-                                    scan_type,
-                                    dwell_time,
-                                    scan_cb,
-                                    scan_ctx);
+    return nl_stats_scan_start(radio_cfg,
+                               chan_list,
+                               chan_num,
+                               scan_type,
+                               dwell_time,
+                               scan_cb,
+                               scan_ctx);
 }
 
 bool target_stats_scan_stop(radio_entry_t *radio_cfg,
                             radio_scan_type_t scan_type)
 {
-    return nl80211_stats_scan_stop(radio_cfg, scan_type);
+    return nl_stats_scan_stop(radio_cfg, scan_type);
 }
 
 bool target_stats_scan_get(radio_entry_t *radio_cfg,
@@ -238,13 +238,12 @@ bool target_stats_scan_get(radio_entry_t *radio_cfg,
                            radio_scan_type_t scan_type,
                            dpp_neighbor_report_data_t *scan_results)
 {
-    return nl80211_stats_scan_get(radio_cfg,
-                                  chan_list,
-                                  chan_num,
-                                  scan_type,
-                                  scan_results);
+    return nl_stats_scan_get(radio_cfg,
+                             chan_list,
+                             chan_num,
+                             scan_type,
+                             scan_results);
 }
-
 
 /******************************************************************************
  *  DEVICE definitions
@@ -255,7 +254,7 @@ bool target_stats_device_temp_get(radio_entry_t *radio_cfg,
 {
     int32_t temperature;
 
-    if(temperature = util_get_temp_info(target_map_ifname(radio_cfg->phy_name)) < 0) {
+    if (temperature = util_get_temp_info(target_map_ifname(radio_cfg->phy_name)) < 0) {
         LOG(ERR, "%s: Failed to open temp input files", radio_cfg->phy_name);
         return false;
     }

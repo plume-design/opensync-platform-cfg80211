@@ -35,10 +35,12 @@ UNIT_TYPE := LIB
 
 UNIT_SRC := src/util.c
 UNIT_SRC += src/nl_util.c
-UNIT_SRC += src/target_nl80211.c
-UNIT_SRC += src/stats_nl80211.c
-UNIT_SRC += src/stats_util.c
-UNIT_SRC += src/bsal_nl80211.c
+UNIT_SRC += src/nl80211_target.c
+UNIT_SRC += src/nl80211_client.c
+UNIT_SRC += src/nl80211_scan.c
+UNIT_SRC += src/nl80211_survey.c
+UNIT_SRC += src/nl80211_stats.c
+UNIT_SRC += src/nl80211_bsal.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -I$(STAGING_DIR)/usr/include/libnl3/

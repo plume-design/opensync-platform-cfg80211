@@ -33,7 +33,7 @@ UNIT_SRC := $(TARGET_COMMON_SRC)
 
 # Platform specific target library sources
 UNIT_SRC_PLATFORM := $(OVERRIDE_DIR)
-UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/target_nl80211_stats.c
+UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/target_stats.c
 UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/target_cfg80211.c
 UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/wiphy_info.c
 

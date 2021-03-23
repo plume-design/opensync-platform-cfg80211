@@ -682,13 +682,13 @@ static int nl_event_parse(struct nl_msg *msg, void *arg)
         ifidx = nla_get_u32(tb[NL80211_ATTR_IFINDEX]);
         if_indextoname(ifidx, ifname);
     } else if (tb[NL80211_ATTR_IFNAME]) {
-        strncpy(ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
+        STRSCPY(ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]));
     }
 
     if (tb[NL80211_ATTR_WIPHY]) {
         phy = nla_get_u32(tb[NL80211_ATTR_WIPHY]);
         if (tb[NL80211_ATTR_WIPHY_NAME])
-            strncpy(phyname, nla_get_string(tb[NL80211_ATTR_WIPHY_NAME]), IFNAMSIZ);
+            STRSCPY(phyname, nla_get_string(tb[NL80211_ATTR_WIPHY_NAME]));
         else
             snprintf(phyname, sizeof(phyname), "phy%d", phy);
     }
