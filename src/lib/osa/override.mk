@@ -1,0 +1,16 @@
+OSA_SRC_NIF_GRE := $(OVERRIDE_DIR)/src/os_nif_gre.c
+OSA_SRC_DNSMASQ := $(OVERRIDE_DIR)/src/os_dnsmasq.c
+OSA_SRC_SSDK    := $(OVERRIDE_DIR)/src/os_ssdk.c
+OSA_SRC_MCPROXY := $(OVERRIDE_DIR)/src/os_mcproxy.c
+
+OSA_SRC += $(OSA_SRC_NIF_GRE)
+OSA_SRC += $(OSA_SRC_DNSMASQ)
+OSA_SRC += $(OSA_SRC_SSDK)
+OSA_SRC += $(OSA_SRC_MCPROXY)
+
+UNIT_SRC_TOP += $(OSA_SRC)
+
+UNIT_CFLAGS += -I$(OVERRIDE_DIR)/inc
+UNIT_EXPORT_CFLAGS  += -I$(OVERRIDE_DIR)/inc
+
+UNIT_DEPS += src/lib/common

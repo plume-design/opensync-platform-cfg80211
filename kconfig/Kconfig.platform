@@ -1,0 +1,17 @@
+menuconfig NL80211_INTERFACE_LAYER
+    bool "NL80211 interface abstraction layer"
+    default y
+    help
+        Enable NL80211 interface abstraction layer
+
+config MAC80211_WIPHY_PREFIX
+    string "mac80211 wiphy prefix"
+    default "phy"
+
+config MAC80211_WIPHY_PATH
+    string "mac80211 wiphy path"
+    default "/sys/class/ieee80211"
+
+config WIFI_UNUSED_IFACE_LIST
+    string "Unused WiFi interfaces to be removed on WM init"
+    default ""
