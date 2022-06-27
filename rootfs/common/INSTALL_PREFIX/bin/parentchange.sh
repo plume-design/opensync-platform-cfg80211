@@ -74,13 +74,13 @@ usage() {
 }
 
 prep() {
-	if [ $radio == "phy1" ]; then
-		band="24"
-	elif [ $radio == "phy0" ]; then
-		band="u50"
-	elif [ $radio == "phy2" ]; then
-		band="l50"
-	fi
+	band=$(grep "^$radio\$" /sys/class/net/*/phy80211/name \
+		| sed 1q \
+		| xargs dirname \
+		| sed 's:/phy80211::' \
+		| xargs basename \
+		| tr '-' '\n' \
+		| tail -n1) || die "Failed to infer band suffix"
 }
 
 sanity() {

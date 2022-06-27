@@ -18,7 +18,6 @@ UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/target_switch.c
 UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/target_mcproxy.c
 UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/hostapd_util.c
 UNIT_SRC_TOP += $(UNIT_SRC_PLATFORM)/target_util.c
-UNIT_SRC_TOP += $(OVERRIDE_DIR)/ecm_util.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/ssdk_util.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/mcproxy_util.c
 

@@ -81,6 +81,7 @@ static const struct {
     { 0, 0, "qcom,cnss-qca8074", "qca8074", "Hawkeye" },
     { 0, 0, "qcom,cnss-qca8074v2", "qca8074", "Hawkeye" },
     { 0, 0, "mediatek,mt7622-wmac", "mt7622", "Mediatek" },
+    { 0, 0, "mediatek,wbsys", "mt7986", "Mediatek" },
     { 0x7915, 0x14c3, 0, "mt7915", "Mediatek" },
     { 0x7615, 0x14c3, 0, "mt7615", "Mediatek" },
 };

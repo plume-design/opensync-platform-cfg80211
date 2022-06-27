@@ -71,6 +71,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "target_cfg80211.h"
 #include "target_util.h"
 #include "nl80211.h"
+#include "kconfig.h"
+#include "opensync-ctrl-dpp.h"
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
 
@@ -293,7 +295,7 @@ util_file_write(const char *path, const char *buf, int len)
     int fd;
     int err;
     int errno2;
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
         return -1;
     err = write(fd, buf, len);
@@ -2073,6 +2075,20 @@ int target_bsal_send_action(const char *ifname, const uint8_t *mac_addr,
                          const uint8_t *data, unsigned int data_len)
 {
     return nl_bsal_send_action(ifname, mac_addr, data, data_len);
+}
+
+/******************************************************************************
+ * DPP Support
+ *****************************************************************************/
+
+bool target_dpp_supported(void)
+{
+    return kconfig_enabled(CONFIG_TARGET_USE_DPP);
+}
+
+bool target_dpp_config_set(const struct schema_DPP_Config **config)
+{
+    return ctrl_dpp_config(config);
 }
 
 /******************************************************************************

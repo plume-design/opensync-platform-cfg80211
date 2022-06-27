@@ -15,3 +15,9 @@ config MAC80211_WIPHY_PATH
 config WIFI_UNUSED_IFACE_LIST
     string "Unused WiFi interfaces to be removed on WM init"
     default ""
+
+config TARGET_USE_DPP
+    bool "Use DPP for WPA Key Managment"
+    default n
+    help
+        Add support for WFA Easy Connect (DPP).
