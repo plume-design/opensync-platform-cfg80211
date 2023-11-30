@@ -1,0 +1,7 @@
+#
+# MTK IGMP implementation
+#
+if PLATFORM_IS_MTK
+orsource "../src/lib/osn/kconfig/Kconfig.osn.igmp_backend"
+endif
+

@@ -1,0 +1,8 @@
+config OSN_BACKEND_QOS_MTK
+    bool "MTK hw qos"
+
+    depends on PLATFORM_IS_MTK
+    default n
+    select OSN_LINUX_ENABLED
+    help
+        Use the MTK hw qos for qos management.

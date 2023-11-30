@@ -38,6 +38,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <netlink/genl/ctrl.h>
 #include <netlink/genl/genl.h>
 #include <net/if.h>
+#include "kconfig.h"
 
 static target_survey_record_t* target_survey_record_alloc()
 {
@@ -90,8 +91,8 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
         survey_record->info.chan = util_freq_to_chan(
                                         nla_get_u32(si[NL80211_SURVEY_INFO_FREQUENCY]));
 
-    if (si[NL80211_SURVEY_INFO_TIME_RX])
-        survey_record->chan_self = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_RX]);
+    if (si[NL80211_SURVEY_INFO_TIME_BSS_RX])
+        survey_record->chan_self = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_BSS_RX]);
 
     if (si[NL80211_SURVEY_INFO_TIME_TX])
         survey_record->chan_tx = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_TX]);
@@ -109,7 +110,10 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
         survey_record->duration_ms = nla_get_u64(si[NL80211_SURVEY_INFO_TIME]);
 
     if (si[NL80211_SURVEY_INFO_NOISE])
-        survey_record->chan_noise = nla_get_u8(si[NL80211_SURVEY_INFO_NOISE]);
+        survey_record->chan_noise = (int32_t)(int8_t)nla_get_u8(si[NL80211_SURVEY_INFO_NOISE]);
+
+    if (survey_record->chan_noise == 0)
+        survey_record->chan_noise = DEFAULT_NOISE_FLOOR;
 
     ds_dlist_insert_tail(nl_call_param->list, survey_record);
 
@@ -160,7 +164,7 @@ bool nl80211_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 
         if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && (survey->info.chan == chan_list[0])) {
             LOGT("Fetched %s %s %u survey "
-            "{active=%u busy=%u tx=%u rx=%u dur=%u}",
+            "{active=%u busy=%u tx=%u rx=%u noise=%d dur=%u}",
             radio_get_name_from_type(radio_cfg->type),
             radio_get_scan_name_from_type(scan_type),
             survey->info.chan,
@@ -168,11 +172,12 @@ bool nl80211_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
             survey->chan_busy,
             survey->chan_tx,
             survey->chan_rx,
+            survey->chan_noise,
             survey->duration_ms);
             ds_dlist_insert_tail(survey_list, survey);
         } else if ((scan_type != RADIO_SCAN_TYPE_ONCHAN) && (survey->duration_ms != 0)) {
             LOGT("Fetched %s %s %u survey "
-            "{active=%u busy=%u tx=%u rx=%u dur=%u}",
+            "{active=%u busy=%u tx=%u rx=%u noise=%d dur=%u}",
             radio_get_name_from_type(radio_cfg->type),
             radio_get_scan_name_from_type(scan_type),
             survey->info.chan,
@@ -180,6 +185,7 @@ bool nl80211_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
             survey->chan_busy,
             survey->chan_tx,
             survey->chan_rx,
+            survey->chan_noise,
             survey->duration_ms);
             ds_dlist_insert_tail(survey_list, survey);
         } else {
@@ -191,20 +197,91 @@ bool nl80211_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
     return ret;
 }
 
+bool nl80211_stats_survey_check_offchan_scan(radio_entry_t *radio_cfg,
+                                            target_survey_record_t *data_new,
+                                            target_survey_record_t *data_old)
+{
+    if (!kconfig_enabled(CONFIG_PLATFORM_IS_MTK))
+        return false;
+
+    if (radio_cfg->chan == data_new->info.chan)
+        return false;
+
+    if (data_new->chan_tx != data_old->chan_tx)
+        return true;
+
+    if (data_new->chan_self != data_old->chan_self)
+        return true;
+
+    if (data_new->chan_rx != data_old->chan_rx)
+        return true;
+
+    if (data_new->chan_busy_ext != data_old->chan_busy_ext)
+        return true;
+
+    if (data_new->chan_busy != data_old->chan_busy)
+        return true;
+
+    if (data_new->duration_ms != data_old->duration_ms)
+        return true;
+
+    return false;
+}
+
 bool nl80211_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t scan_type,
                                   target_survey_record_t *data_new, target_survey_record_t *data_old,
                                   dpp_survey_record_t *survey_record)
 {
-    survey_record->info.timestamp_ms = data_new->info.timestamp_ms;
-    survey_record->info.chan     = data_new->info.chan;
-    survey_record->chan_tx       = PERCENT(data_new->chan_tx, data_new->duration_ms);
-    survey_record->chan_self     = PERCENT(data_new->chan_self, data_new->duration_ms);
-    survey_record->chan_rx       = PERCENT(data_new->chan_rx, data_new->duration_ms);
-    survey_record->chan_busy_ext = PERCENT(data_new->chan_busy_ext, data_new->duration_ms);
-    survey_record->chan_busy     = PERCENT(data_new->chan_busy, data_new->duration_ms);
-    survey_record->duration_ms   = data_new->duration_ms;
+    target_survey_record_t data;
+
+    // MTK offchan scan will reset register, so it doesn't calculate the delta value
+    if (nl80211_stats_survey_check_offchan_scan(radio_cfg, data_new, data_old))
+    {
+        data.chan_tx       = data_new->chan_tx;
+        data.chan_self     = data_new->chan_self;
+        data.chan_rx       = data_new->chan_rx;
+        data.chan_busy_ext = data_new->chan_busy_ext;
+        data.chan_busy     = data_new->chan_busy;
+        data.duration_ms  =  data_new->duration_ms;
+        data.chan_noise    = data_new->chan_noise;
+        data.chan_active   = data_new->chan_active;
+    } else {
+        data.chan_tx       = STATS_DELTA(data_new->chan_tx, data_old->chan_tx);
+        data.chan_self     = STATS_DELTA(data_new->chan_self, data_old->chan_self);
+        data.chan_rx       = STATS_DELTA(data_new->chan_rx, data_old->chan_rx);
+        data.chan_busy_ext = STATS_DELTA(data_new->chan_busy_ext, data_old->chan_busy_ext);
+        data.chan_busy     = STATS_DELTA(data_new->chan_busy, data_old->chan_busy);
+        data.duration_ms  =  STATS_DELTA(data_new->duration_ms, data_old->duration_ms);
+        data.chan_noise    = data_new->chan_noise;
+        data.chan_active   = data_new->chan_active;
+    }
+
     LOGT("Processed %s %s %u survey delta "
-         "{active=%u busy=%u tx=%u self=%u rx=%u ext=%u}",
+         "{active=%u busy=%u tx=%u self=%u rx=%u ext=%u noise=%d duration_ms =%u}",
+         radio_get_name_from_type(radio_cfg->type),
+         radio_get_scan_name_from_type(scan_type),
+         data_new->info.chan,
+         data.chan_active,
+         data.chan_busy,
+         data.chan_tx,
+         data.chan_self,
+         data.chan_rx,
+         data.chan_busy_ext,
+         data.chan_noise,
+         data.duration_ms);
+
+    survey_record->info.chan     = data_new->info.chan;
+    survey_record->chan_tx       = PERCENT(data.chan_tx, data.duration_ms);
+    survey_record->chan_self     = PERCENT(data.chan_self, data.duration_ms);
+    survey_record->chan_rx       = PERCENT(data.chan_rx, data.duration_ms);
+    survey_record->chan_busy_ext = PERCENT(data.chan_busy_ext, data.duration_ms);
+    survey_record->chan_busy     = PERCENT(data.chan_busy, data.duration_ms);
+    survey_record->chan_noise    = data.chan_noise;
+    survey_record->duration_ms   = data.duration_ms;
+    survey_record->chan_active   = data.chan_active;
+
+    LOGT("Processed %s %s %u survey delta (percent) "
+         "{active=%u busy=%u tx=%u self=%u rx=%u noise=%d ext=%u}",
          radio_get_name_from_type(radio_cfg->type),
          radio_get_scan_name_from_type(scan_type),
          survey_record->info.chan,
@@ -213,6 +290,7 @@ bool nl80211_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t sc
          survey_record->chan_tx,
          survey_record->chan_self,
          survey_record->chan_rx,
+         survey_record->chan_noise,
          survey_record->chan_busy_ext);
 
     return true;

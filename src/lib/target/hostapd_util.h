@@ -31,6 +31,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include "kconfig.h"
 
 #define HOSTAPD_CONTROL_PATH_DEFAULT "/var/run"
 #define EXEC(...) strexa(__VA_ARGS__)
@@ -70,8 +71,11 @@ bool hostapd_rrm_set_neighbor(const char *interface, const char *bssid, const ch
 
 bool hostapd_rrm_remove_neighbor(const char *interface, const char *bssid);
 
+#ifdef CONFIG_PLATFORM_IS_MTK
+bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add, int disconnect);
+#else
 bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add);
-
+#endif
 bool hostapd_rrm_beacon_report_request(
         const char *vif,
         const char *mac_addr,
@@ -90,9 +94,7 @@ bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_
 
 int hostapd_mac_acl_clear(const char *phy, const char *vif);
 
-bool hostapd_status_get_hw_mode(const char *phy, char *ap_vif, char *buf, int buf_len);
-
-bool hostapd_status_get_bcn_int(const char *phy, char *ap_vif, int *val);
+bool hostapd_get_vif_status(const char *vif, const char *key, char *value);
 
 int hostapd_chan_switch(
         const char *phy,

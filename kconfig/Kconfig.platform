@@ -17,7 +17,40 @@ config WIFI_UNUSED_IFACE_LIST
     default ""
 
 config TARGET_USE_DPP
-    bool "Use DPP for WPA Key Managment"
+    bool "Use DPP for WPA Key Management"
     default n
     help
         Add support for WFA Easy Connect (DPP).
+
+config CFG80211_NF_NAT_HELPERS
+    bool "Use preferred OpenSync netfilter NAT helpers"
+    default y
+    help
+        This will overwrite /etc/modules.d/nf-nathelper-extra
+        with preferred OpenSync options.
+
+config TARGET_USE_ANTENNA_AS_CHAIN
+    bool "Use antenna mask directly as both TX/RX chain mask"
+    default n
+
+config TARGET_SUPPORT_WIFI7
+    bool "Add support for WIFI 7"
+    default n
+    help
+        Add support for WIFI 7.
+
+menuconfig PLATFORM_IS_MTK
+    bool "MediaTek"
+    help
+        Support for MediaTek platform
+
+if PLATFORM_IS_MTK
+
+config MTK_HW_ACC_FILE_PATH
+    string "Hardware acceleration file path"
+    default "/sys/kernel/debug/xt_flowoffload/flush"
+    help
+        This is the file where MAC addresses of OpenFlow rules
+        are stored for flushing.
+
+endif

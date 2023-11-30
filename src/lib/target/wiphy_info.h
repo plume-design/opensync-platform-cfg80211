@@ -29,6 +29,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "nl80211.h"
 
+/* local types */
+enum {
+    CHAN_2GHZ = 1 << 0,
+    CHAN_5GHZ_LOWER = 1 << 1,
+    CHAN_5GHZ_UPPER = 1 << 2,
+    CHAN_6GHZ = 1 << 3,
+};
+
 struct wiphy_info
 {
     const char *chip;

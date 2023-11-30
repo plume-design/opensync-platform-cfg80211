@@ -373,10 +373,10 @@ util_get_chanwidth(struct ie_channel_info *info)
     }
 }
 
-int nl80211_scan_cmp(void *_a, void  *_b)
+int nl80211_scan_cmp(const void *_a, const void  *_b)
 {
-    struct nl80211_scan *a = _a;
-    struct nl80211_scan *b = _b;
+    const struct nl80211_scan *a = _a;
+    const struct nl80211_scan *b = _b;
 
     return strcmp(a->name, b->name);
 }
@@ -411,7 +411,7 @@ static int nl80211_scan_add(char *name, target_scan_cb_t *scan_cb, void *scan_ct
 int nl80211_scan_trigger(struct nl_global_info *nl_sm_global,
                          char *ifname, uint32_t *chan_list, uint32_t chan_num,
                          int dwell_time, radio_scan_type_t scan_type,
-                         target_scan_cb_t *scan_cb, void *scan_ctx)
+                         target_scan_cb_t *scan_cb, void *scan_ctx, radio_type_t r_type)
 {
     int if_index;
     struct nl_msg *msg;
@@ -435,7 +435,10 @@ int nl80211_scan_trigger(struct nl_global_info *nl_sm_global,
 
     freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
     for (i = 0; i < chan_num; i++)
-         nla_put_u32(msg, i, util_chan_to_freq(chan_list[i]));
+        if (r_type == RADIO_TYPE_6G)
+             nla_put_u32(msg, i, util_chan_to_freq_6g(chan_list[i]));
+        else
+             nla_put_u32(msg, i, util_chan_to_freq(chan_list[i]));
     nla_nest_end(msg, freq);
 
     ret = nl80211_scan_add(ifname, scan_cb, scan_ctx);
@@ -462,7 +465,7 @@ bool nl80211_stats_scan_start(radio_entry_t *radio_cfg, uint32_t *chan_list,
     bool ret = true;
 
     if (nl80211_scan_trigger(nl_sm_global, ifname, chan_list, chan_num,
-                                dwell_time, scan_type, scan_cb, scan_ctx) < 0)
+                                dwell_time, scan_type, scan_cb, scan_ctx, radio_cfg->type) < 0)
         ret = false;
     LOGT("%s: scan trigger returned %d", radio_cfg->if_name, ret);
 
@@ -482,13 +485,18 @@ struct nl80211_scan *nl80211_scan_find(char *name)
     struct nl80211_scan *nl80211_scan = ds_tree_find(&nl80211_scan_tree, name);
 
     if (!nl80211_scan)
-        LOGN("%s: scan context does not exist", name);
+        LOGT("%s: scan context does not exist", name);
 
     return nl80211_scan;
 }
 
 void nl80211_scan_del(struct nl80211_scan *nl80211_scan)
 {
+    if (nl80211_scan == NULL)
+    {
+        LOGE("%s: nl80211_scan is NULL", nl80211_scan->name);
+        return;
+    }
     LOGT("%s: delete scan context", nl80211_scan->name);
     ev_async_stop(EV_DEFAULT, &nl80211_scan->async);
     ds_tree_remove(&nl80211_scan_tree, nl80211_scan);
@@ -501,19 +509,22 @@ void nl80211_scan_finish(char *name, bool state)
 
     if (nl80211_scan) {
         LOGN("%s: calling context cb", nl80211_scan->name);
+        if (nl80211_scan->scan_cb == NULL)
+        {
+            LOGE("%s: nl80211_scan_finish scan_cb is NULL", nl80211_scan->name);
+            return;
+        }
         (*nl80211_scan->scan_cb)(nl80211_scan->scan_ctx, state);
         nl80211_scan_del(nl80211_scan);
     }
 }
 
-int nl80211_scan_abort(struct nl_global_info *nl_sm_global, char *ifname)
+int nl80211_scan_abort(struct nl_global_info *nl_sm_global, struct nl80211_scan *nl80211_scan)
 {
     int if_index;
     struct nl_msg *msg;
-    struct nl80211_scan *nl80211_scan;
 
-    nl80211_scan = nl80211_scan_find(ifname);
-    if ((if_index = util_sys_ifname_to_idx(ifname)) < 0) {
+    if ((if_index = util_sys_ifname_to_idx(nl80211_scan->name)) < 0) {
         return -EINVAL;
     }
 
@@ -533,13 +544,26 @@ bool nl80211_stats_scan_stop(radio_entry_t *radio_cfg,
                              radio_scan_type_t scan_type)
 {
     struct nl_global_info *nl_sm_global = get_nl_sm_global();
-    char *ifname = radio_cfg->if_name;
     bool ret = true;
+    struct nl80211_scan *nl80211_scan;
+    struct nl80211_scan *nl80211_scan_next;
 
-    if (nl80211_scan_abort(nl_sm_global, ifname) < 0)
-        ret = false;
+    if (!ds_tree_is_empty(&nl80211_scan_tree))
+    {
+        nl80211_scan = ds_tree_head(&nl80211_scan_tree);
 
-    LOGT("%s: scan abort returned %d", radio_cfg->if_name, ret);
+        while (nl80211_scan != NULL)
+        {
+            nl80211_scan_next = ds_tree_next(&nl80211_scan_tree, nl80211_scan);
+
+            LOGT("%s scan abort", nl80211_scan->name);
+            if (nl80211_scan_abort(nl_sm_global, nl80211_scan) < 0)
+                ret = false;
+
+            LOGT("scan abort returned %d", ret);
+            nl80211_scan = nl80211_scan_next;
+        }
+    }
 
     return true;
 }
@@ -584,21 +608,12 @@ static int nl80211_scan_dump_recv(struct nl_msg *msg, void *arg)
     if (bss[NL80211_BSS_FREQUENCY])
         neighbor->entry.chan =
                     util_freq_to_chan((int)nla_get_u32(bss[NL80211_BSS_FREQUENCY]));
-    if (bss[NL80211_BSS_SIGNAL_MBM])
-        neighbor->entry.sig = ((int) nla_get_u32(bss[NL80211_BSS_SIGNAL_MBM])) / 100;
-    /*
-        TODO: At this time, we report signal as SNR by using fixed noise floor.
-        Need to revise the implementation to support dynamic noise floor in
-        opensync 2.2 and above.
-    */
-    /* Convert to SNR before sending to cloud */
-    neighbor->entry.sig -= DEFAULT_NOISE_FLOOR;
-
-    /* Prevent sending negative values */
-    if (neighbor->entry.sig < 0) {
-        LOGT("Found negative signal/noise ratio %d, forcing value to 0", neighbor->entry.sig);
-        neighbor->entry.sig = 0;
+    if (bss[NL80211_BSS_SIGNAL_MBM]) {
+        /* Cast from unsigned to signed to get negative value. Example: For a meaningful
+         RSSI value -75 dBm i.e. -7500 mBm we have UINT32_MAX-7500 = 4294959795 */
+        neighbor->entry.sig = ((int32_t) nla_get_u32(bss[NL80211_BSS_SIGNAL_MBM])) / 100;
     }
+
     if (bss[NL80211_BSS_SEEN_MS_AGO])
         neighbor->entry.lastseen = nla_get_u32(bss[NL80211_BSS_SEEN_MS_AGO]);
     if (bss[NL80211_BSS_BSSID]) {
@@ -680,9 +695,43 @@ bool nl80211_stats_scan_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
         .list = &scan_results->list,
     };
     bool ret = true;
+    dpp_neighbor_record_list_t      *neighbor = NULL;
+    ds_dlist_iter_t                 record_iter;
+    int chan_noise = DEFAULT_NOISE_FLOOR;
+    int if_index;
 
     if (nl80211_scan_dump(nl_sm_global, &nl_call_param) < 0)
         ret = false;
+
+    /* Convert to SNR */
+    if (scan_type == RADIO_SCAN_TYPE_ONCHAN)
+    {
+        if ((if_index = util_sys_ifname_to_idx(nl_call_param.ifname)) >= 0)
+        {
+            chan_noise = util_get_curr_chan_noise(nl_sm_global, if_index, chan_list[0]);
+        }
+    }
+
+    for (neighbor = ds_dlist_ifirst(&record_iter, nl_call_param.list);
+            neighbor != NULL;
+            neighbor = ds_dlist_inext(&record_iter))
+    {
+        neighbor->entry.sig -= chan_noise;  // cloud considers RSSI as SNR
+
+        /* Prevent sending negative values */
+        if (neighbor->entry.sig < 0) {
+            LOGT("Found negative signal/noise ratio %d, forcing value to 0", neighbor->entry.sig);
+            neighbor->entry.sig = 0;
+        }
+        LOGT("%s Parsed %s SSID %s {bssid %s, chan %u, chanwidth %d, signal %d}",
+         __func__,
+        radio_get_name_from_type(nl_call_param.type),
+        neighbor->entry.ssid,
+        neighbor->entry.bssid,
+        neighbor->entry.chan,
+        neighbor->entry.chanwidth,
+        neighbor->entry.sig);
+    }
 
     LOGT("Parsed %s %s scan results for channel %d",
          radio_get_name_from_type(radio_cfg->type),

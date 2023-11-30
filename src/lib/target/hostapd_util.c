@@ -40,6 +40,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "hostapd_util.h"
 #include "target_util.h"
 #include "nl80211.h"
+#include "wiphy_info.h"
+#include "target_cfg80211.h"
+
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
 
@@ -157,7 +160,11 @@ bool hostapd_rrm_remove_neighbor(const char *vif, const char *bssid)
     return ret;
 }
 
+#ifdef CONFIG_PLATFORM_IS_MTK
+bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add, int disconnect)
+#else
 bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add)
+#endif
 {
     char hostapd_cmd[1024];
     bool ret = true;
@@ -167,11 +174,19 @@ bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add)
     if (util_wifi_get_parent(vif, phy, sizeof(phy)))
         return false;
 
+#ifdef CONFIG_PLATFORM_IS_MTK
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
+            "DENY_ACL %s "MAC_ADDRESS_FORMAT,
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
+            add ? (disconnect ? "ADD_MAC" : "BAK_MAC") : "DEL_MAC", MAC_ADDRESS_PRINT(mac_addr));
+#else
     snprintf(hostapd_cmd, sizeof(hostapd_cmd),
             "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
             "DENY_ACL %s "MAC_ADDRESS_FORMAT,
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
             add ? "ADD_MAC" : "DEL_MAC", MAC_ADDRESS_PRINT(mac_addr));
+#endif
 
     status = !cmd_log(hostapd_cmd);
     if (!status) {
@@ -326,69 +341,45 @@ bool hostapd_get_mac_acl_info(const char *phy,
     return true;
 }
 
-bool hostapd_status_get_hw_mode(const char *phy, char *ap_vif, char *buf, int buf_len)
+bool hostapd_get_vif_status(const char *vif, const char *key, char *value)
 {
-    char sockdir[64] = "";
+    char phy[BFR_SIZE_64];
+    char sockdir[BFR_SIZE_64] = "";
+    char buf[256];
     char *bss_status;
     const char *k;
     const char *v;
     char *kv;
-    int is_11n = 0;
-    int is_11ac = 0;
-    int is_11ax = 0;
 
-    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
-
-    bss_status = HOSTAPD_CLI(sockdir, ap_vif, "STATUS");
-    if (!bss_status || (!strlen(bss_status)))
+    if (util_get_vif_radio(vif, phy, sizeof(phy))) {
+        LOGD("%s: failed to get ap vif radio", vif);
         return false;
-
-    while ((kv = strsep(&bss_status, "\r\n"))) {
-        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
-            if (!strcmp(k, "ieee80211n"))
-                is_11n = atoi(v);
-            if (!strcmp(k, "ieee80211ac"))
-                is_11ac = atoi(v);
-            if (!strcmp(k, "ieee80211ax"))
-                is_11ax = atoi(v);
-        }
     }
 
-    if (is_11ax)
-        strscpy(buf, "11ax", buf_len);
-    else if (is_11ac)
-        strscpy(buf, "11ac", buf_len);
-    else if (is_11n)
-        strscpy(buf, "11n", buf_len);
+    util_get_opmode(vif, buf, sizeof(buf));
+
+    if (!strcmp(buf, "ap"))
+        snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
+    else if (!strcmp(buf, "sta"))
+        snprintf(sockdir, sizeof(sockdir), "%s/wpa_supplicant-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
     else
         return false;
 
-    return true;
-}
-
-bool hostapd_status_get_bcn_int(const char *phy, char *ap_vif, int *val)
-{
-    char sockdir[64] = "";
-    char *bss_status;
-    const char *k;
-    const char *v;
-    char *kv;
-
-    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, phy);
-
-    bss_status = HOSTAPD_CLI(sockdir, ap_vif, "STATUS");
-    if (!bss_status || (!strlen(bss_status)))
+    bss_status = HOSTAPD_CLI(sockdir, vif, "STATUS");
+    if (!bss_status || (!strlen(bss_status))) {
+        LOGD("%s: failed to get vif status", vif);
         return false;
+    }
 
     while ((kv = strsep(&bss_status, "\r\n"))) {
         if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
-            if (!strcmp(k, "beacon_int")) {
-                *val = atoi(v);
+            if (!strcmp(k, key)) {
+                strcpy(value, v);
+                LOGI("%s: get %s=%s from hostapd status", vif, key, value);
                 return true;
             }
         }
     }
-
     return false;
 }
 
@@ -401,12 +392,25 @@ int hostapd_chan_switch(const char *phy,
 {
     char hostapd_cmd[1024] = "";
     bool status;
+    const struct wiphy_info *wiphy_info;
+    int freq;
+    bool is_6g;
+
+    freq = 0;
+    is_6g = false;
+    wiphy_info = wiphy_info_get(phy);
+    if (wiphy_info && !strcmp(wiphy_info->band, "6G"))
+        is_6g = true;
+    if (!is_6g)
+        freq = util_chan_to_freq(channel);
+    else
+        freq = util_chan_to_freq_6g(channel);
 
     snprintf(hostapd_cmd, sizeof(hostapd_cmd),
             "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s CHAN_SWITCH %d %d %s %s %s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
             CHAN_SWITCH_DEFAULT_CS_COUNT,
-            util_chan_to_freq(channel),
+            freq,
             strlen(center_freq1_str) ? center_freq1_str : "",
             strlen(sec_chan_offset_str) ? sec_chan_offset_str : "",
             strlen(opt_chan_info) ? opt_chan_info : "");

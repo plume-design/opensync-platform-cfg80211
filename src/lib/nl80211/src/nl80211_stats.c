@@ -85,14 +85,14 @@ static int nl_event_parse(struct nl_msg *msg, void *arg)
 
     switch (gnlh->cmd) {
         case NL80211_CMD_TRIGGER_SCAN:
-            LOGN("%s: scan started\n", ifname);
+            LOGT("%s: scan started\n", ifname);
             break;
         case NL80211_CMD_SCAN_ABORTED:
-            LOGN("%s: scan aborted\n", ifname);
+            LOGT("%s: scan aborted\n", ifname);
             nl80211_scan_finish(ifname, false);
             break;
         case NL80211_CMD_NEW_SCAN_RESULTS:
-            LOGN("%s: scan completed\n", ifname);
+            LOGT("%s: scan completed\n", ifname);
             nl80211_scan_finish(ifname, true);
             break;
         default:

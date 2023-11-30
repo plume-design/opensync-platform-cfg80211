@@ -38,16 +38,8 @@ int util_get_temp_info(const char *phyname)
     char path_temp[120] = { 0 };
     const char *buf_temp;
 
-    if (strcmp(phyname, "phy0") == 0)
-        snprintf(path_temp, sizeof(path_temp), CONFIG_MAC80211_WIPHY_PATH"/%s/device/hwmon/hwmon0/temp1_input", phyname);
-    else if (strcmp(phyname, "phy1") == 0)
-        snprintf(path_temp, sizeof(path_temp), CONFIG_MAC80211_WIPHY_PATH"/%s/device/hwmon/hwmon1/temp1_input", phyname);
-    else if (strcmp(phyname, "phy2") == 0)
-        snprintf(path_temp, sizeof(path_temp), CONFIG_MAC80211_WIPHY_PATH"/%s/device/hwmon/hwmon2/temp1_input", phyname);
-    else
-        return -EINVAL;
-
-    buf_temp = strexa("cat", path_temp);
+    snprintf(path_temp, sizeof(path_temp), CONFIG_MAC80211_WIPHY_PATH"/%s/hwmon*/temp1_input", phyname);
+    buf_temp = strexa("sh", "-c", "cat $0", path_temp);
     if (!buf_temp)
         return -EINVAL;
 
@@ -86,8 +78,10 @@ int util_freq_to_chan(int freq)
 
     if (freq < 5000)
         return (1 + ((freq - 2412) / 5));
-    else if (freq < 6000)
+    else if (freq < 5950)
         return ((freq - 5000) / 5);
+    else if (freq < 7130)
+        return ((freq - 5950) / 5);
 
     return 0;
 }
@@ -102,6 +96,17 @@ int util_chan_to_freq(int chan)
         return 4000 + chan * 5;
     else
         return 5000 + chan * 5;
+    return 0;
+}
+
+int util_chan_to_freq_6g(int chan)
+{
+    /* see 802.11ax D6.1 27.3.23.2 */
+    if (chan == 2)
+        return 5935;
+    if (chan <= 253)
+        return 5950 + chan * 5;
+
     return 0;
 }
 
@@ -137,6 +142,11 @@ int util_ht_mode(enum nl80211_chan_width chanwidth, char *ht_mode, int len)
         case NL80211_CHAN_WIDTH_160:
             strscpy(ht_mode, "HT160", len);
             break;
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+        case NL80211_CHAN_WIDTH_320:
+            strscpy(ht_mode, "HT320", len);
+            break;
+#endif
         default:
             return false;
     }

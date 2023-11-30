@@ -70,9 +70,11 @@ static int nl80211_interface_recv(struct nl_msg *msg, void *arg)
     nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
             genlmsg_attrlen(gnlh, 0), NULL);
 
-    if (tb[NL80211_ATTR_SSID] && tb[NL80211_ATTR_IFNAME]) {
+    if (tb[NL80211_ATTR_IFNAME]) {
         ssid_entry = malloc(sizeof(ssid_list_t));
-        STRSCPY(ssid_entry->ssid, nla_data(tb[NL80211_ATTR_SSID]));
+        if (tb[NL80211_ATTR_SSID]) {
+            STRSCPY(ssid_entry->ssid, nla_data(tb[NL80211_ATTR_SSID]));
+        }
         STRSCPY(ssid_entry->ifname, nla_data(tb[NL80211_ATTR_IFNAME]));
         ds_dlist_insert_tail(nl_call_param->list, ssid_entry);
     }
@@ -167,8 +169,11 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
         else if (rinfo[NL80211_RATE_INFO_BITRATE])
             client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE]) / 10;
     }
-    if (sinfo[NL80211_STA_INFO_SIGNAL])
-        client_entry->stats.rssi = (signed char)nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]);
+    if (sinfo[NL80211_STA_INFO_SIGNAL]) {
+        /* Cast from unsigned to signed to get negative value.
+         Example: for a meaningful RSSI value -75 dBm we have UINT8_MAX-75 = 181 */
+        client_entry->stats.rssi = (int8_t)nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]);
+    }
     if (sinfo[NL80211_STA_INFO_TX_PACKETS])
         client_entry->stats.frames_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_PACKETS]);
     if (sinfo[NL80211_STA_INFO_RX_PACKETS])
@@ -189,18 +194,43 @@ static int nl80211_get_assoclist(struct nl_global_info *nl_sm_global,
 {
     int if_index;
     struct nl_msg *msg;
+    target_client_record_t *client_entry = NULL;
+    ds_dlist_iter_t record_iter;
 
     if ((if_index = util_sys_ifname_to_idx(nl_call_param->ifname)) < 0) {
         return -EINVAL;
     }
 
     msg = nlmsg_init(nl_sm_global, NL80211_CMD_GET_STATION, true);
+
     if (!msg) {
         return -EINVAL;
     }
 
     nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
-    nlmsg_send_and_recv(nl_sm_global, msg, nl80211_assoclist_recv, nl_call_param);
+
+    if (nlmsg_send_and_recv(nl_sm_global, msg, nl80211_assoclist_recv, nl_call_param) < 0)
+    {
+        LOGW("%s Get assoc list failed", __func__);
+        return -1;
+    }
+
+    int chan = nl_req_get_iface_curr_chan(nl_sm_global, if_index);
+    int chan_noise = util_get_curr_chan_noise(nl_sm_global, if_index, chan);
+
+    for (client_entry = ds_dlist_ifirst(&record_iter, nl_call_param->list);
+            client_entry != NULL;
+            client_entry = ds_dlist_inext(&record_iter))
+    {
+        client_entry->stats.rssi -= chan_noise;  // cloud considers RSSI as SNR
+
+        /* Prevent sending negative values */
+        if (client_entry->stats.rssi < 0) {
+            LOGT("Found negative rssi %d, forcing value to 0", client_entry->stats.rssi);
+            client_entry->stats.rssi = 0;
+        }
+    }
+
     return 0;
 }
 
@@ -261,19 +291,19 @@ bool nl80211_client_stats_convert(radio_entry_t *radio_cfg, target_client_record
     memcpy(client_record->info.mac, data_new->info.mac, sizeof(data_new->info.mac));
     memcpy(client_record->info.essid, data_new->info.essid, sizeof(radio_cfg->if_name));
 
-    client_record->stats.rssi       = data_new->stats.rssi - DEFAULT_NOISE_FLOOR; // cloud considers rssi as snr
+    client_record->stats.rssi       = data_new->stats.rssi;
     client_record->stats.rate_tx    = data_new->stats.rate_tx;
     client_record->stats.rate_rx    = data_new->stats.rate_rx;
-    client_record->stats.bytes_tx   = data_new->stats.bytes_tx   - data_old->stats.bytes_tx;
-    client_record->stats.bytes_rx   = data_new->stats.bytes_rx   - data_old->stats.bytes_rx;
-    client_record->stats.frames_tx  = data_new->stats.frames_tx  - data_old->stats.frames_tx;
-    client_record->stats.frames_rx  = data_new->stats.frames_rx  - data_old->stats.frames_rx;
-    client_record->stats.retries_tx = data_new->stats.retries_tx - data_old->stats.retries_tx;
-    client_record->stats.errors_tx  = data_new->stats.errors_tx  - data_old->stats.errors_tx;
-    client_record->stats.errors_rx  = data_new->stats.errors_rx  - data_old->stats.errors_rx;
+    client_record->stats.bytes_tx   = STATS_DELTA(data_new->stats.bytes_tx, data_old->stats.bytes_tx);
+    client_record->stats.bytes_rx   = STATS_DELTA(data_new->stats.bytes_rx, data_old->stats.bytes_rx);
+    client_record->stats.frames_tx  = STATS_DELTA(data_new->stats.frames_tx, data_old->stats.frames_tx);
+    client_record->stats.frames_rx  = STATS_DELTA(data_new->stats.frames_rx, data_old->stats.frames_rx);
+    client_record->stats.retries_tx = STATS_DELTA(data_new->stats.retries_tx, data_old->stats.retries_tx);
+    client_record->stats.errors_tx  = STATS_DELTA(data_new->stats.errors_tx, data_old->stats.errors_tx);
+    client_record->stats.errors_rx  = STATS_DELTA(data_new->stats.errors_rx, data_old->stats.errors_rx);
 
     LOGT("Calculated %s client delta stats for "MAC_ADDRESS_FORMAT" "
-         "bytes_tx=%llu rssi=%d",
+         "bytes_tx=%"PRIu64"  rssi=%d",
          radio_get_name_from_type(radio_cfg->type),
          MAC_ADDRESS_PRINT(data_new->info.mac),
          client_record->stats.bytes_tx, client_record->stats.rssi);

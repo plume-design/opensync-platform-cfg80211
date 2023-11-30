@@ -43,5 +43,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
             err || strcmp(str, buf); \
         })
 
+int util_get_opmode(const char *vif, char *opmode, int len);
+int util_get_vif_radio(const char *in_vif, char *phy_buf, int len);
 void nl_wm_deinit();
 void nl_sm_deinit();

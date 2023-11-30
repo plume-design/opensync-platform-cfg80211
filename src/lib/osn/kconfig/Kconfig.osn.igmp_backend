@@ -1,0 +1,10 @@
+config OSN_BACKEND_IGMP_MTK
+    bool "MTK mcproxy"
+
+    select OSN_LINUX_ENABLED
+    help
+        Use the MTK `mcproxy` utility for managing IGMP.
+
+        MTK platforms use mcproxy binary for correctly configuring up IGMP
+        traffic.
+

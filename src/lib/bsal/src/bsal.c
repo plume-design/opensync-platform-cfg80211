@@ -87,6 +87,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <opensync-wpas.h>
 #include <opensync-hapd.h>
 #include "wpa_ctrl.h"
+#include "kconfig.h"
+#include "ovsdb_sync.h"
 
 /***************************************************************************************/
 
@@ -182,6 +184,8 @@ struct ieee80211_mgmt {
 #define HE_PHYCAP_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G   ((uint8_t) BIT(2))
 #define HE_PHYCAP_CHANNEL_WIDTH_SET_160MHZ_IN_5G        ((uint8_t) BIT(3))
 #define HE_PHYCAP_CHANNEL_WIDTH_SET_80PLUS80MHZ_IN_5G   ((uint8_t) BIT(4))
+
+#define EV(x) strchomp(strdupa(x), " ")
 
 static inline uint16_t bsal_get_le16(const uint8_t *a)
 {
@@ -367,6 +371,28 @@ static bsal_max_chwidth_t get_max_chwidth(hostapd_sta_info_t *sta)
         max_chwidth = BSAL_MAX_CHWIDTH_80MHZ;
         if (sta->vht_caps_info & IEEE80211_VHTCAP_SUP_CHAN_WIDTH_160) {
             max_chwidth = BSAL_MAX_CHWIDTH_160MHZ;
+        }
+    }
+
+    if (sta->he_phy_capab_info[HE_PHYCAP_CHANNEL_WIDTH_SET_IDX] &
+        HE_PHYCAP_CHANNEL_WIDTH_MASK) {
+
+        if ((sta->he_phy_capab_info[HE_PHYCAP_CHANNEL_WIDTH_SET_IDX] &
+            HE_PHYCAP_CHANNEL_WIDTH_SET_160MHZ_IN_5G) ||
+            (sta->he_phy_capab_info[HE_PHYCAP_CHANNEL_WIDTH_SET_IDX] &
+            HE_PHYCAP_CHANNEL_WIDTH_SET_80PLUS80MHZ_IN_5G)) {
+
+            max_chwidth = BSAL_MAX_CHWIDTH_160MHZ;
+        }
+        else if (sta->he_phy_capab_info[HE_PHYCAP_CHANNEL_WIDTH_SET_IDX] &
+            HE_PHYCAP_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G) {
+
+            max_chwidth = BSAL_MAX_CHWIDTH_80MHZ;
+        }
+        else if (sta->he_phy_capab_info[HE_PHYCAP_CHANNEL_WIDTH_SET_IDX] &
+            HE_PHYCAP_CHANNEL_WIDTH_SET_40MHZ_IN_2G) {
+
+            max_chwidth = BSAL_MAX_CHWIDTH_40MHZ;
         }
     }
     return max_chwidth;
@@ -703,6 +729,40 @@ static void bsal_hapd_sta_connected(struct hapd *hapd, const char *mac, const ch
     _bsal_event_cb(&event);
 }
 
+static void bsal_hapd_sta_disconnected(struct hapd *hapd, const char *in_buf)
+{
+    bsal_event_t event = { 0 };
+    os_macaddr_t bssid;
+    bsal_cli_info *client;
+    char *parse_buf = strdupa(in_buf);
+
+    event.type = BSAL_EVENT_CLIENT_DISCONNECT;
+
+    STRSCPY(event.ifname, hapd->ctrl.bss);
+
+    if (os_nif_macaddr_from_str(&bssid, parse_buf))
+        memcpy(&event.data.disconnect.client_addr, &bssid, sizeof(event.data.disconnect.client_addr));
+
+    event.data.disconnect.type = BSAL_DISC_TYPE_DISASSOC;
+
+    client = bsal_get_client(hapd->ctrl.bss, &bssid);
+    if (client) {
+        client->connected = false;
+        client->xing_level = SNR_NONE;
+    }
+
+    LOGI("%s: bsal event.type:%d event.ifname:%s STA=" PRI(os_macaddr_t)
+         " disconnect.type=%d disconnect.reason=%d",
+         __func__, event.type, event.ifname,
+         FMT(os_macaddr_t, *(os_macaddr_t *) event.data.disconnect.client_addr),
+         event.data.disconnect.type, event.data.disconnect.reason);
+
+    _bsal_event_cb(&event);
+
+    return;
+}
+
+
 static void bsal_hapd_frame_disconnect(struct hapd *hapd, const char *in_buf)
 {
     char         *kv;
@@ -798,7 +858,7 @@ static int bsal_process_assoc_req_frame(const char *ifname, const char *frame, i
         memcpy(client->assoc_ies, ies, ies_len);
         client->assoc_ies_len = ies_len;
     } else {
-        LOGI("%s: received assoc ies length[%d] exceeds buffer len[%d]",
+        LOGI("%s: received assoc ies length[%zd] exceeds buffer len[%zu]",
              __func__, ies_len, sizeof(client->assoc_ies));
     }
 
@@ -933,7 +993,7 @@ static void bsal_hapd_frame_probe_req(struct hapd *hapd, const char *buf)
 
     STRSCPY(event.ifname, hapd->ctrl.bss);
 
-    // NL80211-CMD-FRAME type=EVT-FRAME-PROBE-REQ sa=9a:00:80:9d:d4:66 ssi_signal=-79 ssid_null=1
+    // NL80211-CMD-FRAME type=EVT-FRAME-PROBE-REQ sa=9a:00:80:9d:d4:66 ssi_signal=-79 ssid_null=1 blocked=1
     while ((kv = strsep(&parse_buf, " "))) {
         if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
             if (!strcmp(k, "ssi_signal")) {
@@ -943,14 +1003,15 @@ static void bsal_hapd_frame_probe_req(struct hapd *hapd, const char *buf)
             }
             if (!strcmp(k, "ssid_null"))
                 event.data.probe_req.ssid_null = atoi(v);
+            if (!strcmp(k, "blocked"))
+                event.data.probe_req.blocked = atoi(v);
             if (!strcmp(k, "sa"))
                 if (os_nif_macaddr_from_str(&bssid, v))
                     memcpy(&event.data.probe_req.client_addr, &bssid, sizeof(event.data.probe_req.client_addr));
         }
     }
-    event.data.probe_req.blocked = false;
 
-    LOGI("%s: bsal event.type:%d probe_req.rssi:%d probe_req.ssid_null:%d " PRI(os_macaddr_t),
+    LOGD("%s: bsal event.type:%d probe_req.rssi:%d probe_req.ssid_null:%d " PRI(os_macaddr_t),
          __func__, event.type, event.data.probe_req.rssi, event.data.probe_req.ssid_null,
          FMT(os_macaddr_t, *(os_macaddr_t *)event.data.probe_req.client_addr));
 
@@ -959,7 +1020,85 @@ static void bsal_hapd_frame_probe_req(struct hapd *hapd, const char *buf)
     return;
 }
 
-int hostap_init_bss(const char *bss)
+static void
+bsal_hapd_ctrl_cb(struct ctrl *ctrl, int level, const char *buf, size_t len)
+{
+    struct hapd *hapd = container_of(ctrl, struct hapd, ctrl);
+    const char *keyid = NULL;
+    const char *pkhash = NULL;
+    const char *event;
+    const char *mac = NULL;
+    const char *k;
+    const char *v;
+    const char *type = "";
+    char *args = strdupa(buf);
+    char *kv;
+
+    event = strsep(&args, " ") ?: "_nope_";
+
+    if (!strcmp(event, EV(NL_CMD_FRAME))) {
+        while ((kv = strsep(&args, " "))) {
+            if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+                if (!strcmp(k, "type")) {
+                    type = v;
+                    break;
+                }
+            }
+        }
+        if (!strcmp(type, EVT_FRAME_PROBE_REQ)) {
+            bsal_hapd_frame_probe_req(hapd, args);
+        } else if (!strcmp(type, EVT_FRAME_ACTION)) {
+            bsal_hapd_frame_action(hapd, args);
+        } else if (!strcmp(type, EVT_FRAME_DISCONNECT)) {
+            bsal_hapd_frame_disconnect(hapd, args);
+        } else {
+            nl80211_cmd_frame_event(hapd, buf);
+        }
+    }
+
+    if (!strcmp(event, EV(AP_STA_CONNECTED))) {
+        mac = strsep(&args, " ") ?: "";
+
+        while ((kv = strsep(&args, " "))) {
+            if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
+                if (!strcmp(k, "keyid"))
+                    keyid = v;
+                if (!strcmp(k, "dpp_pkhash"))
+                    pkhash = v;
+            }
+        }
+
+        LOGI("%s: %s: connected keyid=%s pkhash=%s", hapd->ctrl.bss, mac, keyid ?: "", pkhash ?: "");
+        if (hapd->sta_connected)
+            hapd->sta_connected(hapd, mac, keyid);
+
+        return;
+    }
+
+    if (!strcmp(event, EV(AP_STA_DISCONNECTED)))
+    {
+        bsal_hapd_sta_disconnected(hapd, args);
+    }
+
+
+    LOGD("%s: event: <%d> %s", ctrl->bss, level, buf);
+}
+
+static bool is_onewifi_enabled()
+{
+    // equivalent to: ovsh s Node_Services -w service==owm status
+    // positive case output: status | enabled |
+    json_t *owm_rows = ovsdb_sync_select("Node_Services", "service", "owm");
+    json_t *owm_status = json_object_get(json_array_get(owm_rows, 0), "status");
+    const char *status_value = json_string_value(owm_status);
+    if ((status_value == NULL) || (strcmp(status_value, "enabled") != 0)) {
+        return false;
+    } else {
+        return true;
+    }
+}
+
+static int hostap_init_bss(const char *bss)
 {
     const char *phy;
     char p_buf[BFR_SIZE_32] = {0};
@@ -977,11 +1116,17 @@ int hostap_init_bss(const char *bss)
     if (WARN_ON(!hapd))
         return -1;
 
-    hapd->sta_connected = bsal_hapd_sta_connected;
+    if (!is_onewifi_enabled())
+        hapd->sta_connected = bsal_hapd_sta_connected;
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK))
+        hapd->ctrl.cb = bsal_hapd_ctrl_cb;
+
+#ifndef CONFIG_PLATFORM_IS_MTK
     hapd->cmd_frame = nl80211_cmd_frame_event;
     hapd->cmd_frame_probe_req = bsal_hapd_frame_probe_req;
     hapd->cmd_frame_action = bsal_hapd_frame_action;
     hapd->cmd_frame_disconnect = bsal_hapd_frame_disconnect;
+#endif
 
     if (!ctrl_enable(&hapd->ctrl))
         LOGI("%s: bsal hapd initialized for %s", __func__, bss);
@@ -1033,10 +1178,17 @@ static int hapd_cli_bsal_acl_mac(
         const uint8_t *mac_addr,
         bool add)
 {
+#ifdef CONFIG_PLATFORM_IS_MTK
+    if (!hostapd_deny_acl_update(ifname, mac_addr, add, false)) {
+        LOGN("Failed to update MAC ACL list");
+        return -1;
+    }
+#else
     if (!hostapd_deny_acl_update(ifname, mac_addr, add)) {
         LOGN("Failed to update MAC ACL list");
         return -1;
     }
+#endif
 
     LOGI("%s: %s MAC DENY_ACL list updated - %s mac=" PRI(os_macaddr_t),
          __func__, ifname, add ? "blocked" : "unblocked", FMT(os_macaddr_t, *(os_macaddr_t *) mac_addr));
@@ -1062,7 +1214,7 @@ static int bsal_bs_client_config(
 
     // Blacklist station if not connected and HWM == 1
     if (conf->rssi_probe_hwm == BM_CLIENT_MAGIC_HWM) {
-        if (!client->connected)
+        if (!client->connected || kconfig_enabled(CONFIG_PLATFORM_IS_MTK))
             hapd_cli_bsal_acl_mac(ifname, mac_addr, true);
     } else if (!conf->rssi_probe_hwm) {
         hapd_cli_bsal_acl_mac(ifname, mac_addr, false);
@@ -1182,7 +1334,7 @@ int nl_bsal_client_info(
          " rssi[%d] snr[%d]"
          " max_chwidth[%d] max_streams[%d]"
          " max_MCS[%d] phy_mode[%d]"
-         " tx_bytes[%lld] rx_bytes[%lld]",
+         " tx_bytes[%"PRIu64"] rx_bytes[%"PRIu64"]",
          __func__,
          FMT(os_macaddr_t, client->mac_addr),
          client->rssi,
@@ -1272,7 +1424,7 @@ static bool hapd_cli_rrm_bcn_rpt_request(
              rrm_params->rand_ivl,
              rrm_params->meas_dur,
              rrm_params->meas_mode,
-             (strlen(hex_ssid)/2),
+             (uint8_t)(strlen(hex_ssid)/2),
              hex_ssid,
              rrm_params->rep_cond,
              rrm_params->rpt_detail);

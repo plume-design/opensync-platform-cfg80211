@@ -271,3 +271,64 @@ void netlink_deinit(struct nl_global_info *nl_global)
     nl_cb_put(nl_global->nl_cb);
     nl_global->nl_cb = NULL;
 }
+
+static int nl_resp_parse_noise(struct nl_msg *msg, void *arg)
+{
+    struct noise_info *noise_info = (struct noise_info *) arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct nlattr *infoattr[NL80211_SURVEY_INFO_MAX + 1];
+    static struct nla_policy s_policy[NL80211_SURVEY_INFO_MAX + 1] = {
+        [NL80211_SURVEY_INFO_FREQUENCY] = { .type = NLA_U32 },
+        [NL80211_SURVEY_INFO_NOISE]     = { .type = NLA_U8 },
+    };
+
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (!tb[NL80211_ATTR_SURVEY_INFO])
+        return NL_SKIP;
+
+    if (nla_parse_nested(infoattr, NL80211_SURVEY_INFO_MAX, tb[NL80211_ATTR_SURVEY_INFO], s_policy))
+        return NL_SKIP;
+
+    if (!infoattr[NL80211_SURVEY_INFO_FREQUENCY])
+        return NL_SKIP;
+
+    if (util_freq_to_chan(nla_get_u32(infoattr[NL80211_SURVEY_INFO_FREQUENCY])) != noise_info->chan)
+        return NL_SKIP;
+
+    if (!infoattr[NL80211_SURVEY_INFO_NOISE])
+        return NL_SKIP;
+
+    noise_info->noise = (int8_t) nla_get_u8(infoattr[NL80211_SURVEY_INFO_NOISE]);
+
+    return NL_SKIP;
+}
+
+int util_get_curr_chan_noise(struct nl_global_info *nl_global, int if_idx, int channel)
+{
+    struct nl_msg *msg;
+    struct noise_info noise_info = { 0 };
+
+    if (if_idx < 0) {
+        LOGD("%s: Invalid interface index", __func__);
+        return DEFAULT_NOISE_FLOOR;
+    }
+
+    noise_info.chan = channel;
+    if (noise_info.chan <= 0 || noise_info.chan >= IEEE80211_CHAN_MAX)
+        return DEFAULT_NOISE_FLOOR;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_SURVEY, true);
+    if (!msg)
+        return DEFAULT_NOISE_FLOOR;
+
+    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_idx);
+
+    if (nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_noise, &noise_info) < 0)
+        return 0;
+
+    if (noise_info.noise == 0) noise_info.noise = DEFAULT_NOISE_FLOOR;
+
+    return noise_info.noise;
+}

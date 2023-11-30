@@ -24,9 +24,55 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef OS_MCPROXY_H_INCLUDED
-#define OS_MCPROXY_H_INCLUDED
+/*
+ * MTK flowtable utilities
+ */
 
-bool os_is_mcproxy_available(void);
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 
-#endif /* OS_MCPROXY_H_INCLUDED */
+#include "hw_acc.h"
+#include "os.h"
+#include "log.h"
+#include "kconfig.h"
+
+#define MODULE_ID LOG_MODULE_ID_TARGET
+
+bool hw_acc_flush(struct hw_acc_flush_flow_t *flow)
+{
+    return true;
+}
+
+bool hw_acc_flush_flow_per_device(int devid)
+{
+    return true;
+}
+
+bool hw_acc_flush_flow_per_mac(const char *mac)
+{
+#ifdef CONFIG_PLATFORM_IS_MTK
+    if (file_put(CONFIG_MTK_HW_ACC_FILE_PATH, mac) == -1)
+    {
+        return false;
+    }
+    LOGD("hw_acc: flushed mac '%s'", mac);
+#endif
+    return true;
+}
+
+bool hw_acc_flush_all_flows(void)
+{
+    return true;
+}
+
+void hw_acc_enable()
+{
+    return;
+}
+
+void hw_acc_disable()
+{
+    return;
+}

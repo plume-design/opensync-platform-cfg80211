@@ -50,6 +50,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <unistd.h>
 #include <time.h>
 #include "os_random.h"
+#include "os_nif.h"
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "util.h"
@@ -84,17 +85,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  * GLOBALS
  *****************************************************************************/
 
-#define HOME_AP_PREFIX  "home-ap"
-#define HOME_AP_24      "home-ap-24"
-#define BHAUL_AP_24     "bhaul-ap-24"
-#define ONBOARD_AP_24   "onboard-ap-24"
-#define IFNAME_TYPE_AP  "-ap-"
-#define IFNAME_TYPE_STA "-sta-"
+#define IFNAME_TYPE_AP  "ap"
+#define IFNAME_TYPE_STA "sta"
 
 #define UTIL_CB_PHY         "phy"
 #define UTIL_CB_VIF         "vif"
 #define UTIL_CB_KV_KEY      "delayed_update_ifname_list"
 #define UTIL_CB_DELAY_SEC   1
+#define RADIUS_SUPPORTED_MAX 8 /* arbitrary max number of all (A and AA) servers */
 
 struct nl_global_info   target_nl_global;
 static ev_timer         g_util_cb_timer;
@@ -131,14 +129,21 @@ static struct target_radio_ops rops;
 static struct schema_Wifi_Radio_Config *g_rconfs;
 static struct schema_Wifi_VIF_Config *g_vconfs;
 ovsdb_table_t table_Wifi_Radio_Config;
+ovsdb_table_t table_Wifi_Radio_State;
 ovsdb_table_t table_Wifi_VIF_Config;
 static int g_num_rconfs;
 static int g_num_vconfs;
 
 struct channel_status g_chan_status[IEEE80211_CHAN_MAX];
 
+static bool util_lookup_rconf_by_ifname(struct schema_Wifi_Radio_Config *rconf, const char *ifname);
+static bool util_lookup_rstate_by_ifname(struct schema_Wifi_Radio_State *rstate, const char *ifname);
 static bool util_radio_country_get(const char *phy, char *country, int country_len);
-
+static void util_hapd_conf_param_set(struct hapd *hapd,
+                const struct schema_Wifi_VIF_Config *vconf,
+                const struct schema_Wifi_Radio_Config *rconf);
+static void util_hapd_conf_param_get(struct hapd *hapd,
+                struct schema_Wifi_VIF_State *vstate);
 /******************************************************************************
  * Generic helpers
  *****************************************************************************/
@@ -381,50 +386,140 @@ void ht_mode_to_mode(const struct schema_Wifi_Radio_Config *rconf, char *mode, i
 {
     if (!rconf->hw_mode_exists) return;
 
-    if (!strcmp(rconf->hw_mode, "11ac"))
-        strscpy(mode, "ht vht", mode_len);
     if (!strcmp(rconf->hw_mode, "11n"))
         strscpy(mode, "ht", mode_len);
-
+    else if (!strcmp(rconf->hw_mode, "11ac"))
+        strscpy(mode, "ht vht", mode_len);
+    else if (!strcmp(rconf->hw_mode, "11ax")) {
+        if (strstr(rconf->freq_band, "2.4G"))
+            strscpy(mode, "ht he", mode_len);
+        else if (strstr(rconf->freq_band, "5G"))
+            strscpy(mode, "ht vht he", mode_len);
+        else if (strstr(rconf->freq_band, "6G"))
+            strscpy(mode, "ht vht he", mode_len);
+    }
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+    else if (!strcmp(rconf->hw_mode, "11be")) {
+        if (strstr(rconf->freq_band, "2.4G"))
+            strscpy(mode, "ht he", mode_len);
+        else if (strstr(rconf->freq_band, "5G"))
+            strscpy(mode, "ht vht he eht", mode_len);
+        else if (strstr(rconf->freq_band, "6G"))
+            strscpy(mode, "ht vht he eht", mode_len);
+    }
+#endif
     return;
 }
 
 int get_sec_chan_offset(const struct schema_Wifi_Radio_Config *rconf)
 {
+    bool is_6g = !strcmp(rconf->freq_band, "6G");
     if (!strcmp(rconf->ht_mode, "HT40")
         || !strcmp(rconf->ht_mode, "HT80")
-        || !strcmp(rconf->ht_mode, "HT160")) {
-        switch (rconf->channel) {
-            case 1 ... 7:
-            case 36:
-            case 44:
-            case 52:
-            case 60:
-            case 100:
-            case 108:
-            case 116:
-            case 124:
-            case 132:
-            case 140:
-            case 149:
-            case 157:
-                return 1;
-            case 8 ... 13:
-            case 40:
-            case 48:
-            case 56:
-            case 64:
-            case 104:
-            case 112:
-            case 120:
-            case 128:
-            case 136:
-            case 144:
-            case 153:
-            case 161:
-                return -1;
-            default:
-                return -EINVAL;
+        || !strcmp(rconf->ht_mode, "HT160")
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+        || !strcmp(rconf->ht_mode, "HT320")
+#endif
+        ) {
+        if (!is_6g) {
+            switch (rconf->channel) {
+                case 1 ... 7:
+                case 36:
+                case 44:
+                case 52:
+                case 60:
+                case 100:
+                case 108:
+                case 116:
+                case 124:
+                case 132:
+                case 140:
+                case 149:
+                case 157:
+                    return 1;
+                case 8 ... 13:
+                case 40:
+                case 48:
+                case 56:
+                case 64:
+                case 104:
+                case 112:
+                case 120:
+                case 128:
+                case 136:
+                case 144:
+                case 153:
+                case 161:
+                    return -1;
+                default:
+                    return -EINVAL;
+            }
+        } else {
+            switch (rconf->channel) {
+                case 1:
+                case 9:
+                case 17:
+                case 25:
+                case 33:
+                case 41:
+                case 49:
+                case 57:
+                case 65:
+                case 73:
+                case 81:
+                case 89:
+                case 97:
+                case 105:
+                case 113:
+                case 121:
+                case 129:
+                case 137:
+                case 145:
+                case 153:
+                case 161:
+                case 169:
+                case 177:
+                case 185:
+                case 193:
+                case 201:
+                case 209:
+                case 217:
+                case 225:
+                case 233:
+                     return 1;
+                case 5:
+                case 13:
+                case 21:
+                case 29:
+                case 37:
+                case 45:
+                case 53:
+                case 61:
+                case 69:
+                case 77:
+                case 85:
+                case 93:
+                case 101:
+                case 109:
+                case 117:
+                case 125:
+                case 133:
+                case 141:
+                case 149:
+                case 157:
+                case 165:
+                case 173:
+                case 181:
+                case 189:
+                case 197:
+                case 205:
+                case 213:
+                case 221:
+                case 229:
+                    return -1;
+                default:
+                    return -EINVAL;
+            }
         }
     }
 
@@ -478,6 +573,10 @@ const int *dfs_get_chanlist_from_centerchan(const int channel, const int centerc
         return chanlist;
 
     chanlist = unii_5g_chan2list(channel, 80);
+    if (centerchan == get_chanlist_cfreq(chanlist))
+        return chanlist;
+
+    chanlist = unii_5g_chan2list(channel, 160);
     if (centerchan == get_chanlist_cfreq(chanlist))
         return chanlist;
 
@@ -608,15 +707,6 @@ static void util_kv_radar_set(const char *phy, const unsigned char chan)
  *****************************************************************************/
 
 static bool
-util_net_ifname_exists(const char *ifname, int *v)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ifname);
-    *v = 0 == access(path, X_OK);
-    return true;
-}
-
-static bool
 util_net_phy_exists(const char *phy, int *v)
 {
     char path[128];
@@ -702,6 +792,7 @@ util_wifi_get_all_phy_vif_type(const char *phy, char *buf, int len, char *type)
     char phy_path[BFR_SIZE_128];
     DIR *d;
     char *phy_name;
+    char mode[BFR_SIZE_32] = {};
 
     memset(buf, 0, len);
 
@@ -713,9 +804,8 @@ util_wifi_get_all_phy_vif_type(const char *phy, char *buf, int len, char *type)
         return -1;
 
     for (p = readdir(d); p ; p = readdir(d)) {
-        if (p->d_name &&
-            strncmp(p->d_name, ".", 1) &&
-            strstr(p->d_name, type)) {
+        if (p->d_name && strncmp(p->d_name, ".", 1) &&
+            util_get_opmode(p->d_name, mode, sizeof(mode)) && !strcmp(mode, type)) {
             phy_name = strchomp(R(F(CONFIG_MAC80211_WIPHY_PATH"/%s/device/net/%s/phy80211/name",
                             phy, p->d_name)), "\r\n ");
 
@@ -737,12 +827,11 @@ util_wifi_get_all_phy_vif_type(const char *phy, char *buf, int len, char *type)
     return 0;
 }
 
-/* Fetch any phy VIF of the type(ap/sta) specified */
+/* Fetch any phy VIF */
 static int
-util_wifi_get_phy_any_vif_type(const char *phy,
+util_wifi_get_phy_any_vif(const char *phy,
                                char *buf,
-                               int len,
-                               char *type)
+                               int len)
 {
     struct dirent *p;
     char phy_path[BFR_SIZE_128];
@@ -756,8 +845,47 @@ util_wifi_get_phy_any_vif_type(const char *phy,
         return -1;
 
     for (p = readdir(d); p ; p = readdir(d)) {
+        if (p->d_name && strncmp(p->d_name, ".", 1)) {
+            phy_name = strchomp(R(F(CONFIG_MAC80211_WIPHY_PATH"/%s/device/net/%s/phy80211/name",
+                            phy, p->d_name)), "\r\n ");
+
+            if (!strcmp(phy_name, phy)) {
+                strscpy(buf, p->d_name, len);
+                break;
+            }
+        }
+    }
+
+    closedir(d);
+
+    if (!strlen(buf))
+        return -1;
+
+    return 0;
+}
+
+/* Fetch any phy VIF of the type(ap/sta) specified */
+static int
+util_wifi_get_phy_any_vif_type(const char *phy,
+                               char *buf,
+                               int len,
+                               char *type)
+{
+    struct dirent *p;
+    char phy_path[BFR_SIZE_128];
+    DIR *d;
+    char *phy_name;
+    char mode[BFR_SIZE_32] = {};
+
+    memset(buf, 0, len);
+
+    snprintf(phy_path, sizeof(phy_path), CONFIG_MAC80211_WIPHY_PATH"/%s/device/net", phy);
+    if (!(d = opendir(phy_path)))
+        return -1;
+
+    for (p = readdir(d); p ; p = readdir(d)) {
         if (p->d_name && strncmp(p->d_name, ".", 1) &&
-            strstr(p->d_name, type)) {
+            util_get_opmode(p->d_name, mode, sizeof(mode)) && !strcmp(mode, type)) {
             phy_name = strchomp(R(F(CONFIG_MAC80211_WIPHY_PATH"/%s/device/net/%s/phy80211/name",
                             phy, p->d_name)), "\r\n ");
 
@@ -920,50 +1048,70 @@ util_wifi_any_phy_vif(const char *phy,
 }
 
 static bool
-util_get_phy_chan(const char *phy,
-                  int *chan)
+util_channel_change_in_progress(const char *phy)
 {
-    char ap_vif[BFR_SIZE_64] = "";
+    struct schema_Wifi_Radio_Config rconf;
+    struct schema_Wifi_Radio_State rstate;
 
-    if (util_wifi_get_phy_any_vif_type(phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: get ap vif failed", phy);
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK) == false)
         return false;
-    }
 
-    *chan = nl_req_get_iface_curr_chan(&target_nl_global, util_sys_ifname_to_idx(ap_vif));
-    if (*chan > 0)
+    if (util_lookup_rconf_by_ifname(&rconf, phy) && 
+        util_lookup_rstate_by_ifname(&rstate, phy) && 
+        rconf.channel_exists && rstate.channel_exists && 
+        rconf.channel != rstate.channel) {
+        LOGI("%s: channel change: Wifi_Radio_Config.channel=%d, Wifi_Radio_State.channel=%d", phy, rconf.channel, rstate.channel);        
         return true;
+    }
 
     return false;
 }
 
 static bool
-util_get_vif_chan(const char *vif,
-                  int *chan)
-{
-    *chan = nl_req_get_iface_curr_chan(&target_nl_global, util_sys_ifname_to_idx(vif));
+util_cac_in_progress(const char *vif)
+{   
+    char state[BFR_SIZE_64];
 
-    if (*chan <= 0)
-        return false;
-
-    /* TODO: Handle CAC in progress case
-     * This can happen when CSA is in progress of
-         * completing and interfaces begin to change the
-         * operational channel one-by-one.
-         *
-         * In that case the channel is undefined until after
-         * CSA fully completes at which point all interfaces
-         * are expected to report same channel.
-         *
-         * This assumes single-channel operation.
-         * Multi-chann capable radios will likely require
-         * ovsdb rework anyway.
-         */
-
-    return true;
+    if (hostapd_get_vif_status(vif, "state", state) && !strcmp(state, "DFS")) {
+        LOGI("%s: CAC is in progress", vif);
+        return true;
+    }
+    return false;
 }
 
-static int
+static bool
+util_get_vif_chan(const char *vif, int *chan)
+{
+    char channel[BFR_SIZE_64];
+
+    *chan = nl_req_get_iface_curr_chan(&target_nl_global, util_sys_ifname_to_idx(vif)); 
+    if (*chan > 0) {
+        LOGI("%s: get channel=%d from driver", vif, *chan);
+    } else if (util_cac_in_progress(vif) && hostapd_get_vif_status(vif, "channel", channel)) {
+        *chan = atoi(channel);
+    }
+
+    return (*chan > 0);
+}
+
+static bool
+util_get_phy_chan(const char *phy, int *chan)
+{
+    char vif[BFR_SIZE_64] = "";
+
+    if (util_wifi_get_phy_any_vif_type(phy, vif, sizeof(vif), IFNAME_TYPE_AP)) {
+        LOGD("%s: get ap vif failed for channel", phy);
+        memset(vif, 0, sizeof(vif));
+        if (util_wifi_get_phy_any_vif_type(phy, vif, sizeof(vif), IFNAME_TYPE_STA)) {
+            LOGD("%s: get vif failed for channel", phy);
+            return false;
+        }
+    }
+
+    return util_get_vif_chan(vif, chan);
+}
+
+int
 util_get_opmode(const char *vif, char *opmode, int len)
 {
     if (vif && strlen(vif) == 0)
@@ -986,19 +1134,125 @@ util_set_tx_power(const char *phy, const int tx_power_dbm)
 static int
 util_get_tx_power(const char *phy)
 {
-    char ap_vif[BFR_SIZE_64] = "";
+    char vif[BFR_SIZE_64] = "";
     int txpwr = 0;
 
-    if (util_wifi_get_phy_any_vif_type(phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: get ap vif failed", phy);
+    if (util_wifi_get_phy_any_vif(phy, vif, sizeof(vif))) {
+        LOGD("%s: get vif failed for tx power", phy);
         return 0;
     }
 
-    txpwr = nl_req_get_txpwr(&target_nl_global, ap_vif);
+    txpwr = nl_req_get_txpwr(&target_nl_global, vif);
     if (txpwr < 0)
         return 0;
 
     return txpwr;
+}
+
+static void
+util_set_antenna(const char *phy, const int tx_antenna, const int rx_antenna)
+{
+    int avail_tx_antenna = 0;
+    int avail_rx_antenna = 0;
+    int curr_tx_antenna = 0;
+    int curr_rx_antenna = 0;
+
+    /* do nothing if one of these not support
+     *  NL80211_ATTR_WIPHY_ANTENNA_AVAIL_TX
+     *  NL80211_ATTR_WIPHY_ANTENNA_AVAIL_RX
+     *  NL80211_ATTR_WIPHY_ANTENNA_TX
+     *  NL80211_ATTR_WIPHY_ANTENNA_RX
+     */
+    if (nl_req_get_antenna(&target_nl_global, phy,
+                           &avail_tx_antenna, &avail_rx_antenna,
+                           &curr_tx_antenna, &curr_rx_antenna))
+        return;
+
+    /* check requested antenna mask are valid or not */
+    if ((tx_antenna & avail_tx_antenna) != tx_antenna ||
+        (rx_antenna & avail_rx_antenna) != rx_antenna) {
+        LOGE("%s: invalid antenna mask 0x%x-0x%x", phy, tx_antenna, rx_antenna);
+        return;
+    }
+
+    /* only update antenna mask when changed and need to disable all associated
+     * interfaces first. the trade-off is this un-managed vif reload would
+     * trigger the topology update then need awhile to recovery the connection.
+     */
+    if (tx_antenna != curr_tx_antenna || rx_antenna != curr_rx_antenna) {
+#define MAX_VIF_NUM         16
+        char vif_list[512];
+        char *vif, *p = vif_list;
+        char *vif_is_up[MAX_VIF_NUM] = { 0 };
+        int v = 0;
+        bool up;
+
+        if (!util_wifi_get_phy_all_vifs(phy, vif_list, sizeof(vif_list))) {
+            LOGI("%s: change antenna %X-%X --> %X-%X", phy,
+                                             curr_tx_antenna, curr_rx_antenna,
+                                             tx_antenna, rx_antenna);
+
+            while ((vif = strsep(&p, " "))) {
+                if (os_nif_is_up(vif, &up) && up) {
+                    if (v == MAX_VIF_NUM) break;
+                    vif_is_up[v++] = vif;
+                    os_nif_up(vif, false);
+                }
+            }
+
+            nl_req_set_antenna(&target_nl_global, phy, tx_antenna, rx_antenna);
+
+            for (v = 0; v < MAX_VIF_NUM; v++) {
+                if (!vif_is_up[v]) break;
+                os_nif_up(vif_is_up[v], true);
+            }
+        }
+#undef MAX_VIF_NUM
+    }
+
+    return;
+}
+
+static int
+util_get_tx_chainmask(const char *phy)
+{
+    int avail_tx_antenna = 0;
+    int avail_rx_antenna = 0;
+    int curr_tx_antenna = 0;
+    int curr_rx_antenna = 0;
+
+    if (nl_req_get_antenna(&target_nl_global, phy,
+                           &avail_tx_antenna, &avail_rx_antenna,
+                           &curr_tx_antenna, &curr_rx_antenna))
+        return 0;
+
+    if (curr_tx_antenna < 0)
+        return 0;
+
+    return curr_tx_antenna;
+}
+
+static int
+util_vif_ap_vlan_addr(const char *vif, char *addr, size_t addrlen)
+{
+    char *stalist = strexa("iwinfo", vif, "assoclist");
+    char *line;
+    const char *macstr;
+
+    memset(addr, 0, addrlen);
+    while ((line = strsep(&stalist, "\r\n"))) {
+        if (line[0] == ' ')
+            continue;
+
+        macstr = strtok(line, " ");
+
+        if (!macstr)
+            continue;
+        strscpy(addr, macstr, addrlen);
+        return 0;
+    }
+
+    return -ENOENT;
 }
 
 /******************************************************************************
@@ -1031,7 +1285,25 @@ util_cb_vif_state_update(const char *vif)
     }
 
     if (rops.op_vstate)
+    {
+        const bool is_ap = (strcmp(vstate.mode, "ap") == 0);
+
         rops.op_vstate(&vstate, phy);
+
+        if (is_ap == true)
+        {
+            struct schema_RADIUS radius_list[RADIUS_SUPPORTED_MAX];
+            int num_radius_list = 0;
+            struct hapd *hapd = hapd_lookup(vif);
+
+            if (hapd && rops.op_radius_state)
+            {
+                hapd_lookup_radius(hapd, radius_list, RADIUS_SUPPORTED_MAX, &num_radius_list);
+                rops.op_radius_state(radius_list, num_radius_list, ifname);
+            }
+
+        }
+    }
 }
 
 static void
@@ -1322,7 +1594,7 @@ wpas_connected(struct wpas *wpas, const char *bssid, int id, const char *id_str)
     wpas_report(wpas);
 
     if (util_wifi_get_phy_any_vif_type(wpas->phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: get ap vif failed", wpas->phy);
+        LOGD("%s: get ap vif failed for wpas connected", wpas->phy);
         return;
     }
 
@@ -1340,6 +1612,11 @@ void dfs_update_chan_state(struct hapd *hapd, const int *chanlist, enum channel_
     enum channel_state old_dfs_state = INVALID;
 
     while (*chanlist) {
+        if (g_chan_status[*chanlist].state == ALLOWED) {
+            /* skip non-DFS channel */
+            chanlist++;
+            continue;
+        }
         old_dfs_state = g_chan_status[*chanlist].state;
 
         /* Channel in NOP_STARTED state should be changed to NOP_FINISHED state first
@@ -1365,56 +1642,25 @@ void dfs_update_chan_state(struct hapd *hapd, const int *chanlist, enum channel_
     util_cb_phy_state_update(hapd->phy);
 }
 
-void dfs_update_chan_state_cac_started(struct hapd *hapd, char *bss_status)
+void dfs_update_chan_state_cac_started(struct hapd *hapd)
 {
+    char channel[BFR_SIZE_64];
+    char vht_oper_centr_freq_seg0_idx[BFR_SIZE_64];
     int chan = 0;
     int cf1 = 0;
     const int *chan_list = NULL;
-    const char *k;
-    const char *v;
-    char *kv;
 
-    while ((kv = strsep(&bss_status, "\r\n"))) {
-        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
-            if (!strcmp(k, "channel"))
-                chan = atoi(v);
-            else if (!strcmp(k, "vht_oper_centr_freq_seg0_idx"))
-                cf1 = atoi(v);
-        }
-    }
-    if (chan) {
-        if (cf1)
+    if (hostapd_get_vif_status(hapd->ctrl.bss, "channel", channel)) {
+        chan = atoi(channel);
+        if (hostapd_get_vif_status(hapd->ctrl.bss, "vht_oper_centr_freq_seg0_idx", vht_oper_centr_freq_seg0_idx)) {
+            cf1 = atoi(vht_oper_centr_freq_seg0_idx);
             chan_list = dfs_get_chanlist_from_centerchan(chan, cf1);
-        else
+        } else {
             chan_list = unii_5g_chan2list(chan, 20);
+        }
         if (chan_list)
             dfs_update_chan_state(hapd, chan_list, CAC_STARTED);
     }
-}
-
-int hostapd_status_get_interface_state(struct hapd *hapd)
-{
-    char sockdir[64] = "";
-    char *bss_status;
-    const char *k;
-    const char *v;
-    char *kv;
-
-    snprintf(sockdir, sizeof(sockdir), "%s/hostapd-%s", HOSTAPD_CONTROL_PATH_DEFAULT, hapd->phy);
-
-    bss_status = HOSTAPD_CLI(sockdir, hapd->ctrl.bss, "STATUS");
-    if (!bss_status || (!strlen(bss_status)))
-        return -1;
-
-    while ((kv = strsep(&bss_status, "\r\n"))) {
-        if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
-            if ((!strcmp(k, "state")) && (!strcmp(v, "DFS"))) {
-                dfs_update_chan_state_cac_started(hapd, bss_status);
-                return 0;
-            }
-        }
-    }
-    return 0;
 }
 
 static void
@@ -1424,18 +1670,15 @@ hapd_ctrl_opened(struct ctrl *ctrl)
 
     hapd_sta_regen(hapd);
     set_hostapd_ctrl(hapd->ctrl.bss, hapd->phy);
-
-    if (hostapd_status_get_interface_state(hapd) < 0)
-        LOGN("failed to get interface status");
 }
 
 static void
 hapd_ctrl_closed(struct ctrl *ctrl)
 {
     struct hapd *hapd = container_of(ctrl, struct hapd, ctrl);
+    util_cb_vif_state_update(hapd->ctrl.bss);
+    util_cb_phy_state_update(hapd->phy);
     hapd_sta_regen(hapd);
-    unlink(hapd->confpath);
-    unlink(hapd->pskspath);
 }
 
 static void
@@ -1446,7 +1689,7 @@ wpas_ctrl_opened(struct ctrl *ctrl)
     wpas_report(wpas);
 
     if (util_wifi_get_phy_any_vif_type(wpas->phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: AP vif not present", wpas->phy);
+        LOGD("%s: get ap vif failed for wpas ctrl opened", wpas->phy);
         return;
     }
 
@@ -1512,11 +1755,6 @@ int radio_check_valid_phy_channel(char *phy, int event_chan)
     char *line;
     int channel;
     char *buf = buffer;
-
-    if (g_chan_status[event_chan].state == ALLOWED) {
-        LOGN("%d channel state is allowed", event_chan);
-        return -1;
-    }
 
     /* checking radar detected channel is valid or not on phy interface */
     if (nl_req_get_channels(&target_nl_global, phy, buffer,sizeof(buffer)) < 0)
@@ -1724,35 +1962,76 @@ static void hapd_dfs_event_pre_cac_expired(struct hapd *hapd, const char *event)
 }
 
 static void
+wpas_ctrl_fill_freqlist(struct wpas *wpas)
+{
+    char    *line;
+    int     channel;
+    char    buffer[BFR_SIZE_4K] = "";
+    char    *buf = buffer;
+    char    tmp[32];
+    int     i = 0;
+
+    if (nl_req_get_channels(&target_nl_global, wpas->phy, buffer, sizeof(buffer)) < 0) {
+        LOGW("%s: failed to fetch channel information", __func__);
+        return;
+    }
+
+    while ((line = strsep(&buf, "\n")) != NULL) {
+        if (sscanf(line, "chan %d DFS %31s", &channel, tmp) == 1) {
+            wpas->freqlist[i++] = util_chan_to_freq(channel);
+        } else if (sscanf(line, "chan %d", &channel) == 1) {
+            wpas->freqlist[i++] = util_chan_to_freq(channel);
+        }
+    }
+}
+
+static void
+wpas_ctrl_fill_freqlist_6g(struct wpas *wpas)
+{
+    char    *line;
+    int     channel;
+    char    buffer[BFR_SIZE_4K] = "";
+    char    *buf = buffer;
+    char    tmp[32];
+    int     i = 0;
+
+    if (nl_req_get_channels(&target_nl_global, wpas->phy, buffer, sizeof(buffer)) < 0) {
+        LOGW("%s: failed to fetch channel information", __func__);
+        return;
+    }
+
+    while ((line = strsep(&buf, "\n")) != NULL) {
+        if (sscanf(line, "chan %d DFS %31s", &channel, tmp) == 1) {
+            wpas->freqlist[i++] = util_chan_to_freq_6g(channel);
+        } else if (sscanf(line, "chan %d", &channel) == 1) {
+            wpas->freqlist[i++] = util_chan_to_freq_6g(channel);
+        }
+    }
+}
+
+static void
 hapd_ap_csa_finished(struct hapd *hapd, const char *event)
 {
     // AP-CSA-FINISHED freq=5180 dfs=0
     LOGI("%s: event[AP-CSA-FINISHED %s]", __func__, event);
 
-    util_cb_vif_state_update(hapd->ctrl.bss);
-    util_cb_phy_state_update(hapd->phy);
-}
+    if (util_channel_change_in_progress(hapd->phy)) {
+        char sta_vif_list[BFR_SIZE_128] = "";
+        char *p_sta_vif_list = sta_vif_list;
+        const char *sta_vif = NULL;
+        struct wpas *wpas;
 
-static int
-get_bhaul_sta_chan(const char *bss)
-{
-    int chan = 0;
-    char sta_vif[32] = "";
-    struct hapd *hapd = NULL;
-
-    hapd = hapd_lookup(bss);
-    if (!hapd)
-        return 0;
-
-    if (util_wifi_get_phy_any_vif_type(hapd->phy, sta_vif, sizeof(sta_vif), IFNAME_TYPE_STA))
-        return 0;
-
-    if (util_get_vif_chan(sta_vif, &chan)) {
-        LOGI("%s:%s: override AP VIF with extender channel %d", hapd->phy, sta_vif, chan);
-        return chan;
+        if (!util_wifi_get_all_phy_vif_type(hapd->phy, sta_vif_list, sizeof(sta_vif_list), IFNAME_TYPE_STA)) {
+            while ((sta_vif = strsep(&p_sta_vif_list, " "))) {
+                wpas = wpas_lookup(sta_vif);
+                LOGI("%s: wpas conf apply after hapd CSA finished", wpas->phy);
+                WARN_ON(wpas_conf_apply(wpas) < 0);
+            }
+        }
     }
 
-    return 0;
+    util_cb_vif_state_update(hapd->ctrl.bss);
+    util_cb_phy_state_update(hapd->phy);
 }
 
 static void
@@ -1763,12 +2042,16 @@ hostap_ctrl_discover(const char *bss)
     const char *phy;
     char mode[32] = {};
     char p_buf[32] = {0};
+    const struct wiphy_info *wiphy_info;
+    int htcapa = 0;
+    int vhtcapa = 0;
 
     if (util_get_vif_radio(bss, p_buf, sizeof(p_buf))) {
         LOGD("%s: failed to get bss radio", bss);
         return;
     }
     phy = strdupa(p_buf);
+    wiphy_info = wiphy_info_get(phy);
 
     if (util_wifi_is_ap_vlan(bss))
         return;
@@ -1799,12 +2082,83 @@ hostap_ctrl_discover(const char *bss)
         hapd->dfs_event_pre_cac_expired = hapd_dfs_event_pre_cac_expired;
         hapd->ap_csa_finished = hapd_ap_csa_finished;
         hapd->respect_multi_ap = 1;
-        hapd->ieee80211n = 1;
-        hapd->ieee80211ac = 1;
-        hapd->ieee80211ax = 0;
+        if (wiphy_info) {
+            if (strstr(wiphy_info->mode, "11be")) {
+                hapd->ieee80211n = 1;
+                hapd->ieee80211ac = 1;
+                hapd->ieee80211ax = 1;
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+                hapd->ieee80211be = 1;
+#endif
+            } else if (strstr(wiphy_info->mode, "11ax")) {
+                hapd->ieee80211n = 1;
+                hapd->ieee80211ac = 1;
+                hapd->ieee80211ax = 1;
+            } else if (strstr(wiphy_info->mode, "11ac")) {
+                hapd->ieee80211n = 1;
+                hapd->ieee80211ac = 1;
+            } else if (strstr(wiphy_info->mode, "11n")) {
+                hapd->ieee80211n = 1;
+            }
+        }
+        hapd->group_by_phy_name = 1;
+        hapd->use_driver_iface_addr = 1;
+#ifndef CONFIG_PLATFORM_IS_MTK
         hapd->noscan = 1;
-        hapd->ext_chan_override = get_bhaul_sta_chan(bss);
+#endif
         util_radio_country_get(phy, hapd->country, sizeof(hapd->country));
+
+        if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK)) {
+            if (wiphy_info) {
+                LOGD("hostap_ctrl_discover phy(%s), band=%s , codename=%s", phy, wiphy_info->band, wiphy_info->codename);
+                // set htcaps for 2.4G and 5G ap config
+                if (strstr(wiphy_info->band, "2.4G") || strstr(wiphy_info->band, "5G")) {
+                    STRSCPY(hapd->htcaps, "[LDPC][TX-STBC][RX-STBC1]");
+
+                    htcapa = nl_req_get_iface_ht_capa(&target_nl_global, phy);
+
+                    if (htcapa != -EINVAL) {
+                        if (htcapa & HT_CAP_SHORT_GI_20)
+                            STRSCAT(hapd->htcaps, "[SHORT-GI-20]");
+
+                        if (htcapa & HT_CAP_SHORT_GI_40)
+                            STRSCAT(hapd->htcaps, "[SHORT-GI-40]");
+                    }
+                }
+
+                // set vhtcaps for 5G and 6G ap config
+                if ((hapd->ieee80211ac) && strstr(wiphy_info->band, "5G")) {
+                    STRSCPY(hapd->vhtcaps, "[RXLDPC][TX-STBC-2BY1][RX-STBC-1][MAX-A-MPDU-LEN-EXP7]");
+
+                    vhtcapa = nl_req_get_iface_vht_capa(&target_nl_global, phy);
+
+                    if (vhtcapa != -EINVAL) {
+                        if (vhtcapa & VHT_CAP_SHORT_GI_80)
+                            STRSCAT(hapd->vhtcaps, "[SHORT-GI-80]");
+
+                        if (vhtcapa & VHT_CAP_SHORT_GI_160)
+                            STRSCAT(hapd->vhtcaps, "[SHORT-GI-160]");
+
+                        switch ((vhtcapa >> 2) & 3) {
+                            case VHT_CAP_NO_BW_160:  // no 160 MHz
+                                STRSCAT(hapd->vhtcaps, "[VHT80]");
+                                break;
+                            case VHT_CAP_ONLY_BW_160:  // contiguous 160 MHz only
+                                STRSCAT(hapd->vhtcaps, "[VHT160]");
+                                break;
+                            case VHT_CAP_BW160_BW80P80:  // contiguous 160 and 80+80
+                                STRSCAT(hapd->vhtcaps, "[VHT160-80PLUS80]");
+                                break;
+                        }
+                    }
+                }
+
+                if ((hapd->ieee80211ax) && strstr(wiphy_info->band, "6G")) {
+                    strscpy(hapd->vhtcaps, "[MAX-A-MPDU-LEN-EXP0]", sizeof(hapd->vhtcaps));
+                }
+            }
+        }
+
         ctrl_enable(&hapd->ctrl);
         hapd = NULL;
     }
@@ -1820,6 +2174,22 @@ hostap_ctrl_discover(const char *bss)
         wpas->connected = wpas_connected;
         wpas->disconnected = wpas_disconnected;
         wpas->respect_multi_ap = 1;
+
+        if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK)) {
+            wiphy_info = wiphy_info_get(phy);
+            if (wiphy_info) {
+                if (strstr(wiphy_info->band, "2.4G") || strstr(wiphy_info->band, "5G")) {
+                    wpas_ctrl_fill_freqlist(wpas);
+                } else {
+                    wpas_ctrl_fill_freqlist_6g(wpas);
+                }
+            } else {
+                LOGD("wiphy_info is null");
+            }
+        } else {
+            wpas_ctrl_fill_freqlist(wpas);
+        }
+
         ctrl_enable(&wpas->ctrl);
         wpas = NULL;
     }
@@ -1861,7 +2231,11 @@ hostap_ctrl_apply(const char *bss,
                const struct schema_Wifi_VIF_Config *vconf,
                const struct schema_Wifi_Radio_Config *rconf,
                const struct schema_Wifi_Credential_Config *cconf,
-               int num_cconf)
+               const struct schema_Wifi_VIF_Neighbors *nbors_list,
+               const struct schema_RADIUS *radius_list,
+               int num_cconf,
+               int num_nbors_list,
+               int num_radius_list)
 {
     struct hapd *hapd = hapd_lookup(bss);
     struct wpas *wpas = wpas_lookup(bss);
@@ -1872,14 +2246,21 @@ hostap_ctrl_apply(const char *bss,
 
     if (hapd) {
         first = (hapd->ctrl.wpa == NULL);
-        err |= WARN_ON(hapd_conf_gen(hapd, rconf, vconf) < 0);
+        err |= WARN_ON(hapd_conf_gen2(hapd, rconf, vconf, nbors_list, radius_list, num_nbors_list, num_radius_list, bss) < 0);
+        util_hapd_conf_param_set(hapd, vconf, rconf);
+        LOGI("%s: hapd conf apply", hapd->phy);
         err |= WARN_ON(hapd_conf_apply(hapd) < 0);
     }
 
     if (wpas) {
         first = (wpas->ctrl.wpa == NULL);
         err |= WARN_ON(wpas_conf_gen(wpas, rconf, vconf, cconf, num_cconf) < 0);
-        err |= WARN_ON(wpas_conf_apply(wpas) < 0);
+        if (util_channel_change_in_progress(wpas->phy)) {
+            LOGI("%s: postpone wpas conf apply due to channel change", wpas->phy);
+        } else {
+            LOGI("%s: wpas conf apply", wpas->phy);
+            err |= WARN_ON(wpas_conf_apply(wpas) < 0);
+        }
     }
 
     /* FIXME: This should be made generic and moved to WM.
@@ -1921,6 +2302,7 @@ void hapd_reload_ap_vif(const struct schema_Wifi_Radio_Config *rconf, const char
 
     if (hapd) {
         err |= WARN_ON(hapd_conf_gen(hapd, rconf, &vconf) < 0);
+        util_hapd_conf_param_set(hapd, &vconf, rconf);
         err |= WARN_ON(hapd_conf_apply(hapd) < 0);
     }
 
@@ -1943,28 +2325,117 @@ static int util_hostapd_acl_update(const char *phy, const char *vif, const char 
         return hostapd_mac_acl_clear(phy, vif);
 }
 
-static bool util_hostapd_get_hw_mode(const char *phy, char *buf, int buf_len)
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+static bool util_get_center_freq0_chan(const char *phy, int *val)
 {
-    char ap_vif[32] = {};
+    char ap_vif[BFR_SIZE_64];
+    char center_freq0_chan[BFR_SIZE_64];
+
+    *val = 0;
 
     if (util_wifi_get_phy_any_vif_type(phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: get ap vif failed", phy);
+        LOGD("%s: get ap vif failed for center_freq0_chan", phy);
         return false;
     }
 
-    return hostapd_status_get_hw_mode(phy, ap_vif, buf, buf_len);
+    if (hostapd_get_vif_status(ap_vif, "eht_oper_centr_freq_seg0_idx", center_freq0_chan)) {
+        *val = atoi(center_freq0_chan);
+    }
+
+    return *val > 0 ? true : false;
 }
+#endif
 
 static bool util_get_bcn_int(const char *phy, int *val)
 {
-    char ap_vif[BFR_SIZE_64] = "";
+    char ap_vif[BFR_SIZE_64];
+    char beacon_int[BFR_SIZE_64];
 
     if (util_wifi_get_phy_any_vif_type(phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: get ap vif failed", phy);
+        LOGD("%s: get ap vif failed for bcn int", phy);
         return false;
     }
 
-    return hostapd_status_get_bcn_int(phy, ap_vif, val);
+    if (hostapd_get_vif_status(ap_vif, "beacon_int", beacon_int)) {
+        *val = atoi(beacon_int);
+        return true;
+    }
+
+    return false;
+}
+
+static void
+util_hapd_conf_param_set(struct hapd *hapd,
+               const struct schema_Wifi_VIF_Config *vconf,
+               const struct schema_Wifi_Radio_Config *rconf)
+{
+    size_t len = sizeof(hapd->conf);
+    char *buf = hapd->conf;
+    size_t len_used;
+
+    len_used = strnlen(buf, len);
+    if (WARN_ON(len_used == len))
+        return;
+
+    buf += len_used;
+    len -= len_used;
+
+    if (vconf->uapsd_enable_exists)
+        csnprintf(&buf, &len, "uapsd_advertisement_enabled=%d\n", vconf->uapsd_enable);
+
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK) == false)
+    {
+        if (vconf->mcast2ucast_exists)
+            csnprintf(&buf, &len, "multicast_to_unicast=%d\n", !!vconf->mcast2ucast);
+    }
+
+    if (vconf->ap_bridge_exists)
+        csnprintf(&buf, &len, "ap_isolate=%d\n", !vconf->ap_bridge);
+
+    if (rconf->bcn_int_exists)
+        csnprintf(&buf, &len, "beacon_int=%d\n", rconf->bcn_int);
+
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK))
+    {
+        csnprintf(&buf, &len, "noscan=1\n");
+        
+        if (!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_6G))
+        {
+            csnprintf(&buf, &len, "fils_discovery_max_interval=20\n");
+        }
+
+        if (hapd->ieee80211ax == 1) {
+            csnprintf(&buf, &len, "he_su_beamformer=1\n");
+        }
+        csnprintf(&buf, &len, "tx_queue_data2_burst=5.9\n");
+    }
+
+    csnprintf(&buf, &len, "wds_bridge=%s\n", CONFIG_TARGET_LAN_BRIDGE_NAME);
+}
+
+static void
+util_hapd_conf_param_get(struct hapd *hapd, struct schema_Wifi_VIF_State *vstate)
+{
+    const char *conf = R(hapd->confpath) ?: "";
+    char *p;
+
+    if ((vstate->ssid_broadcast_exists = (p = ini_geta(conf, "ignore_broadcast_ssid"))))
+        SCHEMA_SET_STR(vstate->ssid_broadcast, atoi(p) ? "disabled" : "enabled");
+
+    if ((vstate->uapsd_enable_exists = (p = ini_geta(conf, "uapsd_advertisement_enabled"))))
+        vstate->uapsd_enable = atoi(p);
+
+    if ((vstate->rrm_exists = (p = ini_geta(conf, "rrm_neighbor_report"))))
+        vstate->rrm = atoi(p);
+
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK) == false) 
+    {
+        if ((vstate->mcast2ucast_exists = (p = ini_geta(conf, "multicast_to_unicast"))))
+            vstate->mcast2ucast = atoi(p);
+    }
+
+    if ((vstate->ap_bridge_exists = (p = ini_geta(conf, "ap_isolate"))))
+        vstate->ap_bridge = !atoi(p);
 }
 
 /******************************************************************************
@@ -2153,6 +2624,8 @@ util_nl_parse(const void *buf, unsigned int len)
                 util_cb_delayed_update(UTIL_CB_VIF, ifname);
             if (deleted && util_wifi_is_ap_vlan(ifname))
                 util_cb_delayed_update(UTIL_CB_VIF, ifname);
+            if (ifm->ifi_change == IFF_UP)
+                util_cb_delayed_update(UTIL_CB_VIF, ifname);
         }
 }
 
@@ -2244,6 +2717,25 @@ util_nl_listen_start(void)
 /******************************************************************************
  * Radio utilities
  *****************************************************************************/
+static bool
+util_lookup_rconf_by_ifname(struct schema_Wifi_Radio_Config *rconf, const char *ifname)
+{
+    json_t *where = ovsdb_where_simple(SCHEMA_COLUMN(Wifi_Radio_Config, if_name), ifname);
+    if (!where)
+        return false;
+    return ovsdb_table_select_one_where(&table_Wifi_Radio_Config, where, rconf);
+
+}
+
+static bool
+util_lookup_rstate_by_ifname(struct schema_Wifi_Radio_State *rstate, const char *ifname)
+{
+    json_t *where = ovsdb_where_simple(SCHEMA_COLUMN(Wifi_Radio_State, if_name), ifname);
+    if (!where)
+        return false;
+    return ovsdb_table_select_one_where(&table_Wifi_Radio_State, where, rstate);
+
+}
 
 static const char *
 util_radio_channel_state(const char *line, int channel)
@@ -2341,20 +2833,68 @@ util_radio_fallback_parents_set(const char *phy, const struct schema_Wifi_Radio_
 static bool
 util_vif_ht_mode_get(const char *vif, char *htmode, int htmode_len)
 {
-    return nl_req_get_ht_mode(&target_nl_global, vif, htmode, htmode_len);
+    char he_oper_chwidth[BFR_SIZE_64];
+    char vht_oper_chwidth[BFR_SIZE_64];
+    int chwidth = 0;
+    char secondary_channel[BFR_SIZE_64];
+
+    if (nl_req_get_ht_mode(&target_nl_global, vif, htmode, htmode_len)) {
+        LOGI("%s: get ht_mode=%s from driver", vif, htmode);
+        return true;
+    } else if (util_cac_in_progress(vif)) {
+        if (hostapd_get_vif_status(vif, "he_oper_chwidth", he_oper_chwidth)) {
+            chwidth = atoi(he_oper_chwidth);
+        } else if (hostapd_get_vif_status(vif, "vht_oper_chwidth", vht_oper_chwidth)) {
+            chwidth = atoi(vht_oper_chwidth);
+        }
+        switch (chwidth) {
+            case 0: {
+                    if (hostapd_get_vif_status(vif, "secondary_channel", secondary_channel)) {
+                        if (!atoi(secondary_channel)) {
+                            strscpy(htmode, "HT20", htmode_len);
+                        } else {
+                            strscpy(htmode, "HT40", htmode_len);
+                        }
+                    }
+                }
+                break;
+            case 1:
+                strscpy(htmode, "HT80", htmode_len);
+                break;
+            case 2:
+                strscpy(htmode, "HT160", htmode_len);
+                break;
+            default:
+                return false;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 static bool
 util_radio_ht_mode_get(const char *phy, char *htmode, int htmode_len)
 {
-    char ap_vif[BFR_SIZE_64] = "";
+    char vif[BFR_SIZE_64] = "";
+    struct schema_Wifi_Radio_Config rconf;
 
-    if (util_wifi_get_phy_any_vif_type(phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
-        LOGD("%s: get ap vif failed", phy);
-        return false;
+    if (util_wifi_get_phy_any_vif_type(phy, vif, sizeof(vif), IFNAME_TYPE_AP)) {
+        LOGD("%s: get ap vif failed for ht mode", phy);
+        goto rconf_chan;
     }
 
-    return nl_req_get_ht_mode(&target_nl_global, ap_vif, htmode, htmode_len);
+    return util_vif_ht_mode_get(vif, htmode, htmode_len);
+
+rconf_chan:
+    if (util_lookup_rconf_by_ifname(&rconf, phy)) {
+        LOGD("%s: lookup rconf ht mode %s", phy, rconf.ht_mode);
+        strscpy(htmode, rconf.ht_mode, htmode_len);
+        return true;
+    }
+
+    LOGT("%s: get ht mode failed", phy);
+    return false;
 }
 
 static bool
@@ -2381,19 +2921,19 @@ util_radio_country_get(const char *phy, char *country, int country_len)
 bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
 {
     const struct wiphy_info *wiphy_info;
-    const char *freq_band;
-    const char *hw_type;
     char buf[512];
     char *vif;
     int v;
     char htmode[32];
     char country[32];
-    char hwmode[32];
 
     memset(htmode, '\0', sizeof(htmode));
+    memset(country, '\0', sizeof(country));
     memset(rstate, 0, sizeof(*rstate));
 
     schema_Wifi_Radio_State_mark_all_present(rstate);
+    rstate->if_name_exists = true;
+    STRSCPY(rstate->if_name, phy);
     rstate->_partial_update = true;
     rstate->vif_states_present = false;
     rstate->radio_config_present = false;
@@ -2406,12 +2946,23 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
         return false;
     }
 
-    hw_type = wiphy_info->chip;
-    freq_band = wiphy_info->band;
+    if ((rstate->freq_band_exists = wiphy_info->band ? true : false))
+        STRSCPY(rstate->freq_band, wiphy_info->band);
+
+    if ((rstate->hw_mode_exists = wiphy_info->mode ? true : false))
+        STRSCPY(rstate->hw_mode, wiphy_info->mode);
+
+    if ((rstate->hw_type_exists = wiphy_info->chip ? true : false))
+        STRSCPY(rstate->hw_type, wiphy_info->chip);
 
     if (util_wifi_any_phy_vif(phy, vif = A(32))) {
         LOGD("%s: no vifs, some rstate bits will be missing", phy);
     }
+
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+    if ((rstate->center_freq0_chan_exists = util_get_center_freq0_chan(phy, &v)))
+        rstate->center_freq0_chan = v;
+#endif
 
     if ((rstate->mac_exists = (0 == util_net_get_phy_macaddr_str(phy, buf, sizeof(buf)))))
         STRSCPY(rstate->mac, buf);
@@ -2431,27 +2982,52 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
     if ((rstate->country_exists = util_radio_country_get(phy, country, sizeof(country))))
         STRSCPY(rstate->country, country);
 
-    STRSCPY(rstate->if_name, phy);
-    STRSCPY(rstate->hw_type, hw_type);
-    STRSCPY(rstate->freq_band, freq_band);
-
-    rstate->if_name_exists = true;
-    rstate->hw_type_exists = true;
-    rstate->enabled_exists = true;
-    rstate->freq_band_exists = true;
     rstate->hw_params_len = 0;
-
-    if ((rstate->hw_mode_exists = util_hostapd_get_hw_mode(phy, hwmode, sizeof(hwmode))))
-        STRSCPY(rstate->hw_mode, hwmode);
 
     if ((rstate->tx_power = util_get_tx_power(phy)) > 0)
         rstate->tx_power_exists = true;
+
+    if ((rstate->tx_chainmask = util_get_tx_chainmask(phy)) > 0)
+        rstate->tx_chainmask_exists = true;
 
     util_radio_channel_list_get(phy, rstate);
     util_radio_fallback_parents_get(phy, rstate);
     util_kv_radar_get(phy, rstate);
 
     return true;
+}
+
+int util_get_oper_centr_freq_idx(const struct schema_Wifi_Radio_Config *rconf)
+{
+    const int width = atoi(strlen(rconf->ht_mode) > 2 ? rconf->ht_mode + 2 : "20");
+    const int *chans = NULL;
+
+    if (!rconf->freq_band_exists || !rconf->channel_exists)
+        return 0;
+
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+    if (rconf->center_freq0_chan_exists && rconf->center_freq0_chan > 0) {
+        return rconf->center_freq0_chan;
+    } else {
+        goto get_chanlist;
+    }
+#else
+    goto get_chanlist;
+#endif
+
+get_chanlist:
+    if (!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_6G))
+        chans = unii_6g_chan2list(rconf->channel, width);
+
+    if ((!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_5G))
+        || (!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_5GL))
+        || (!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_5GU)))
+        chans = unii_5g_chan2list(rconf->channel, width);
+
+    if (WARN_ON(!chans))
+        return 0;
+
+    return chanlist_to_center(chans);
 }
 
 int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char *phy)
@@ -2473,7 +3049,7 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
     bool    update_channel = false;
     const char *ap_vif = NULL;
 
-    if (util_wifi_get_all_phy_vif_type(phy, ap_vif_list, sizeof(ap_vif_list), IFNAME_TYPE_AP) < 0) {
+    if (util_wifi_get_all_phy_vif_type(phy, ap_vif_list, sizeof(ap_vif_list), IFNAME_TYPE_AP)) {
         LOGI("%s: no ap vaps, channel %d will be set on first vap if possible", phy, rconf->channel);
         return -1;
     }
@@ -2512,8 +3088,12 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
         snprintf(opt_chan_info, sizeof(opt_chan_info), "bandwidth=%d %s", width, mode);
 
     if ((width > 20) || (strstr(mode, "vht"))) {
-        if ((center_chan = unii_5g_centerfreq(rconf->ht_mode, rconf->channel)) > 0) {
-            center_freq1 = util_chan_to_freq(center_chan);
+        if ((center_chan = util_get_oper_centr_freq_idx(rconf)) > 0) {
+            if (!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_6G))
+                center_freq1 = util_chan_to_freq_6g(center_chan);
+            else
+               center_freq1 = util_chan_to_freq(center_chan);
+
             if (center_freq1)
                 snprintf(center_freq1_str, sizeof(center_freq1_str), "center_freq1=%d", center_freq1);
         }
@@ -2523,12 +3103,22 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
 }
 
 bool
+is_center_freq0_chan_changed(const struct schema_Wifi_Radio_Config_flags *changed) {
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+    return changed->center_freq0_chan;
+#else
+    (void)changed;
+    return false;
+#endif
+}
+
+bool
 target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
                          const struct schema_Wifi_Radio_Config_flags *changed)
 {
     const char *phy = rconf->if_name;
 
-    if ((changed->channel || changed->ht_mode)) {
+    if ((changed->channel || changed->ht_mode || is_center_freq0_chan_changed(changed))) {
         if (rconf->channel_exists && rconf->channel > 0 && rconf->ht_mode_exists)
             if (util_channel_switch(rconf, phy) < 0)
                 LOGN("%s: error received while trying to set new channel/ht_mode", __func__);
@@ -2540,8 +3130,17 @@ target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
     if (changed->tx_power)
         util_set_tx_power(phy, rconf->tx_power);
 
+    if (kconfig_enabled(CONFIG_TARGET_USE_ANTENNA_AS_CHAIN) &&
+        changed->tx_chainmask) {
+        /* OpenSync not intend to change RX chain mask and could simply treat
+         * TX/RX chain mask are the same if using antenna mask as chain mask for
+         * maximum compatibility if the WiFi driver does not support unequal
+         * antenna mask, like MediaTek 11ax series.
+         */
+        util_set_antenna(phy, rconf->tx_chainmask, rconf->tx_chainmask);
+    }
+
     util_cb_phy_state_update(phy);
-report:
     util_cb_delayed_update(UTIL_CB_PHY, phy);
 
     return true;
@@ -2578,6 +3177,21 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
                        const struct schema_Wifi_VIF_Config_flags *changed,
                        int num_cconfs)
 {
+    return target_vif_config_set3(vconf, rconf, cconfs, changed, NULL, NULL, num_cconfs, 0, 0);
+}
+
+bool
+target_vif_config_set3(const struct schema_Wifi_VIF_Config *vconf,
+                       const struct schema_Wifi_Radio_Config *rconf,
+                       const struct schema_Wifi_Credential_Config *cconfs,
+                       const struct schema_Wifi_VIF_Config_flags *changed,
+                       const struct schema_Wifi_VIF_Neighbors *nbors_list,
+                       const struct schema_RADIUS *radius_list,
+                       int num_cconfs,
+                       int num_nbors_list,
+                       int num_radius_list)
+{
+
     const char *phy = rconf->if_name;
     const char *vif = vconf->if_name;
     char macaddr[6];
@@ -2622,6 +3236,7 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
     if (rconf->tx_power_exists)
         util_set_tx_power(phy, rconf->tx_power);
 
+    hostap_ctrl_apply(vif, vconf, rconf, cconfs, nbors_list, radius_list, num_cconfs, num_nbors_list, num_radius_list);
     if ((changed->mac_list_type) || (changed->mac_list)) {
         if (vconf->mac_list_type_exists)
             if (!util_hostapd_acl_update(phy, vif,
@@ -2630,7 +3245,17 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
                 LOGT("%s: failed to update mac acl configurations", __func__);
     }
 
-    hostap_ctrl_apply(vif, vconf, rconf, cconfs, num_cconfs);
+    if (changed->mac_list_type)
+        util_kv_set(F("%s.mac_list_type", vif), vconf->mac_list_type);
+
+    if (changed->min_hw_mode)
+        util_kv_set(F("%s.min_hw_mode", vif), vconf->min_hw_mode);
+
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK) && (changed->mcast2ucast))
+    {
+        util_kv_set(F("%s.mcast2ucast", vif), F("%d", vconf->mcast2ucast));
+    }
+
     if (changed->wps_pbc || changed->wps || changed->wps_pbc_key_id) {
         hostap_ctrl_wps_session(vif, vconf->wps, vconf->wps_pbc);
         util_ovsdb_wpa_clear(vconf->if_name);
@@ -2643,6 +3268,68 @@ done:
     return true;
 }
 
+static bool
+util_vif_enabled(char *vif)
+{
+    char state[BFR_SIZE_64];
+    char opmode[256];
+    bool ret;
+    bool running;
+
+    util_get_opmode(vif, opmode, sizeof(opmode));
+
+    if (strcmp(opmode, "ap") == 0) {
+        if (os_nif_is_running(vif, &running) && running) {
+            LOGI("%s:AP VIF is enabled", vif);
+            return true;
+        } else {
+            ret = hostapd_get_vif_status(vif, "state", state);
+            LOGI("%s:ap state %s", vif, state);
+            if (ret == true) {
+                if (strcmp(state, "ENABLED") == 0) {
+                    LOGE("%s: hostap and interface status mismatch", vif);
+                    return false;
+                } else if ((strcmp(state, "DISABLED") == 0) || (strcmp(state, "UNINITIALIZED") == 0))   {
+                    LOGI("%s: VIF is disabled", vif);
+                    return false;
+                } else {
+                    LOGI("%s: VIF is fakely true for hostapd transition state", vif);
+                    return true;
+                }
+            } else {
+                LOGE("%s: hostap ap get status failed", vif);
+                return false;
+            }
+        }
+    } else if (strcmp(opmode, "sta") == 0) {
+        if (os_nif_is_running(vif, &running) && running) {
+            LOGI("%s:STA VIF is enabled", vif);
+            return true;
+        } else {
+            ret = hostapd_get_vif_status(vif, "wpa_state", state);
+            LOGI("%s:sta wpa_state %s", vif, state);
+            if (ret == true) {
+                if (strcmp(state, "COMPLETED") == 0) {
+                    LOGE("%s: hostap and interface status mismatch", vif);
+                    return false;
+                } else if (strcmp(state, "INTERFACE_DISABLED") == 0)   {
+                    LOGI("%s: VIF is disabled", vif);
+                    return false;
+                } else {
+                    LOGI("%s: VIF is fakely true for wpa transition state", vif);
+                    return true;
+                }
+            } else {
+                LOGE("%s: hostap sta get status failed", vif);
+                return false;
+            }
+        }
+    } else {
+        LOGE("%s: unexpected vif mode %s", vif, opmode);
+        return false;
+    }
+}
+
 bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
 {
     struct hapd *hapd = hapd_lookup(vif);
@@ -2651,6 +3338,7 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
     char buf[256];
     int err;
     int v;
+    const struct kvstore *kv;
 
     memset(vstate, 0, sizeof(*vstate));
 
@@ -2662,8 +3350,9 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
     STRSCPY(vstate->if_name, vif);
     vstate->if_name_exists = true;
 
-    if ((vstate->enabled_exists = util_net_ifname_exists(vif, &v)))
-        vstate->enabled = !!v;
+    vstate->enabled_exists = true;
+
+    SCHEMA_SET_INT(vstate->enabled, util_vif_enabled(vif));
 
     util_kv_set(F("%s.last_channel", vif), NULL);
 
@@ -2681,9 +3370,18 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
         STRSCPY(vstate->mode, buf);
 
     if (util_wifi_is_ap_vlan(vif))
+    {
         SCHEMA_SET_STR(vstate->mode, "ap_vlan");
 
+        if (!WARN_ON(util_vif_ap_vlan_addr(vif, buf, sizeof(buf)) < 0))
+            SCHEMA_SET_STR(vstate->ap_vlan_sta_addr, buf);
+    }
+
     vstate->mac_list_type_exists = hostapd_get_mac_acl_info(phy, vif, vstate);
+    if (!vstate->mac_list_type_exists && (kv = util_kv_get(F("%s.mac_list_type", vif)))) {
+        vstate->mac_list_type_exists = true;
+        STRSCPY(vstate->mac_list_type, kv->val);
+    }
 
     if ((vstate->mac_exists = (0 == util_net_get_macaddr_str(vif, buf, sizeof(buf)))))
         STRSCPY(vstate->mac, buf);
@@ -2697,20 +3395,22 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
     if ((vstate->vif_radio_idx_exists = util_wifi_get_macaddr_idx(phy, vif, &v)))
         vstate->vif_radio_idx = v;
 
-    if (strstr(vstate->if_name, HOME_AP_24)) {
+    if ((kv = util_kv_get(F("%s.min_hw_mode", vif)))) {
         vstate->min_hw_mode_exists = true;
-        STRSCPY(vstate->min_hw_mode, "11b");
-    }
-    if (strstr(vstate->if_name, BHAUL_AP_24) || strstr(vstate->if_name, ONBOARD_AP_24)) {
-        vstate->min_hw_mode_exists = true;
-        STRSCPY(vstate->min_hw_mode, "11g");
-    }
-    if (strstr(vstate->if_name, HOME_AP_PREFIX)) {
-        vstate->ap_bridge_exists = true;
-        vstate->ap_bridge = 0;
+        STRSCPY(vstate->min_hw_mode, kv->val);
     }
 
-    if (hapd) hapd_bss_get(hapd, vstate);
+    if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK)) {
+        if ((kv = util_kv_get(F("%s.mcast2ucast", vif)))) {
+            vstate->mcast2ucast_exists = true;
+            vstate->mcast2ucast = atoi(kv->val);
+        }
+    }
+
+    if (hapd) {
+        hapd_bss_get(hapd, vstate);
+        util_hapd_conf_param_get(hapd, vstate);
+    }
     if (wpas) wpas_bss_get(wpas, vstate);
 
     return true;

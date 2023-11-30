@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define NL80211_H_INCLUDED
 
 #include <string.h>
-
+#include <inttypes.h>
 #include "ds_dlist.h"
 #include <ev.h>
 #include "log.h"
@@ -52,12 +52,21 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define MAC_ADDR_LEN 6
 #define SSID_MAX_LEN 32
 
+#define STATS_DELTA(n, o) ((n) < (o) ? (n) : (n) - (o))
 #define PERCENT(v1, v2) (v2 > 0 ? (v1*100/v2) : 0)
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 
 #define IEEE80211_CHAN_MAX  (196 + 1)
 
 #define DEFAULT_NOISE_FLOOR (-95)
+
+#define HT_CAP_SHORT_GI_20     BIT(5)
+#define HT_CAP_SHORT_GI_40     BIT(6)
+#define VHT_CAP_SHORT_GI_80    BIT(5)
+#define VHT_CAP_SHORT_GI_160   BIT(6)
+#define VHT_CAP_NO_BW_160      0x00
+#define VHT_CAP_ONLY_BW_160    0x01
+#define VHT_CAP_BW160_BW80P80  0x02
 
 enum channel_state {
     INVALID,
@@ -129,6 +138,8 @@ int util_freq_to_chan(int freq);
 
 int util_chan_to_freq(int freq);
 
+int util_chan_to_freq_6g(int freq);
+
 int mode_to_nl80211_attr_iftype(const char *mode, enum nl80211_iftype *type);
 
 int util_ht_mode(enum nl80211_chan_width chanwidth, char *ht_mode, int len);
@@ -165,6 +176,13 @@ int nl_req_set_txpwr(struct nl_global_info *nl_global, const char *ifname, const
 
 int nl_req_get_txpwr(struct nl_global_info *nl_global, const char *ifname);
 
+int nl_req_get_antenna(struct nl_global_info *nl_global, const char *ifname,
+                       int *avail_tx_antenna, int *avail_rx_antenna,
+                       int *tx_antenna, int *rx_antenna);
+
+int nl_req_set_antenna(struct nl_global_info *nl_global, const char *ifname,
+                       const int tx_antenna, const int rx_antenna);
+
 int nl_req_get_channels(
         struct nl_global_info *nl_global,
         const char *ifname,
@@ -199,6 +217,12 @@ int nl_req_add_iface(
 
 int nl_req_get_iface_supp_band(struct nl_global_info *nl_global, const char *ifname);
 
+int nl_req_get_iface_ht_capa(struct nl_global_info *nl_global, const char *ifname);
+
+int nl_req_get_iface_vht_capa(struct nl_global_info *nl_global, const char *ifname);
+
 int netlink_wm_init(struct nl_global_info *nl_global);
+
+int util_get_curr_chan_noise(struct nl_global_info *nl_global, int if_idx, int channel);
 
 #endif /* NL80211_H_INCLUDED */

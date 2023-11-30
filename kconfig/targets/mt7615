@@ -1,0 +1,2 @@
+@include "base_cfg80211"
+CONFIG_PLATFORM_IS_MTK=y

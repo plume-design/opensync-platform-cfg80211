@@ -180,6 +180,19 @@ bool target_stats_clients_convert(radio_entry_t *radio_cfg,
  *  SURVEY definitions
  *****************************************************************************/
 
+target_survey_record_t *target_survey_record_alloc()
+{
+    target_survey_record_t *record = NULL;
+
+    record = malloc(sizeof(target_survey_record_t));
+    if (record == NULL)
+        return NULL;
+
+    memset(record, 0, sizeof(target_survey_record_t));
+
+    return record;
+}
+
 void target_survey_record_free(target_survey_record_t *record)
 {
     if (NULL != record)
@@ -218,6 +231,32 @@ bool target_stats_survey_convert(radio_entry_t *radio_cfg,
                                         data_new,
                                         data_old,
                                         survey_record);
+}
+
+
+/******************************************************************************
+ *  CAPACITY definitions
+ *****************************************************************************/
+
+bool target_stats_capacity_enable(radio_entry_t *radio_cfg, bool enabled)
+{
+    /* TODO: need to develop for MTK platform */
+    return true;
+}
+
+bool target_stats_capacity_get(radio_entry_t *radio_cfg,
+                               target_capacity_data_t *capacity_new)
+{
+    /* TODO: need to develop for MTK platform */
+    return true;
+}
+
+bool target_stats_capacity_convert(target_capacity_data_t *capacity_new,
+                                   target_capacity_data_t *capacity_old,
+                                   dpp_capacity_record_t *capacity_entry)
+{
+    /* TODO: need to develop for MTK platform */
+    return true;
 }
 
 

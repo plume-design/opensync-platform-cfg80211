@@ -189,6 +189,95 @@ int nl_req_set_txpwr(struct nl_global_info *nl_global, const char *ifname, const
     return 0;
 }
 
+int nl_resp_parse_antanna(struct nl_msg *msg, void *arg)
+{
+    int *antenna_info = arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (tb[NL80211_ATTR_WIPHY]) {
+        if (tb[NL80211_ATTR_WIPHY_ANTENNA_AVAIL_TX])
+            antenna_info[0] = nla_get_u32(tb[NL80211_ATTR_WIPHY_ANTENNA_AVAIL_TX]);
+
+        if (tb[NL80211_ATTR_WIPHY_ANTENNA_AVAIL_RX])
+            antenna_info[1] = nla_get_u32(tb[NL80211_ATTR_WIPHY_ANTENNA_AVAIL_RX]);
+
+        if (tb[NL80211_ATTR_WIPHY_ANTENNA_TX])
+            antenna_info[2] = nla_get_u32(tb[NL80211_ATTR_WIPHY_ANTENNA_TX]);
+
+        if (tb[NL80211_ATTR_WIPHY_ANTENNA_RX])
+            antenna_info[3] = nla_get_u32(tb[NL80211_ATTR_WIPHY_ANTENNA_RX]);
+    }
+
+    return NL_SKIP;
+}
+
+int nl_req_get_antenna(struct nl_global_info *nl_global, const char *ifname,
+                       int *avail_tx_antenna, int *avail_rx_antenna,
+                       int *tx_antenna, int *rx_antenna)
+{
+    struct nl_msg *msg;
+    int antenna_info[4] = { 0 }; /* 0-1: available Tx/Rx, 2-3: current Tx/Rx */
+    int phy_idx = -EINVAL;
+
+    if (!nl_global)
+        return -EINVAL;
+
+    if ((phy_idx = util_sys_phyname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_WIPHY, false);
+    if (!msg)
+        return -ENOMEM;
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+
+    nlmsg_hdr(msg)->nlmsg_flags |= NLM_F_DUMP;
+
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_antanna, antenna_info);
+
+    if (antenna_info[0] == 0 || antenna_info[1] == 0 ||
+        antenna_info[2] == 0 || antenna_info[3] == 0)
+        return -EINVAL;
+
+    if (avail_tx_antenna)   *avail_tx_antenna = antenna_info[0];
+    if (avail_rx_antenna)   *avail_rx_antenna = antenna_info[1];
+    if (tx_antenna)         *tx_antenna = antenna_info[2];
+    if (rx_antenna)         *rx_antenna = antenna_info[3];
+
+    return 0;
+}
+
+int nl_req_set_antenna(struct nl_global_info *nl_global, const char *ifname,
+                       const int tx_antenna, const int rx_antenna)
+{
+    int phy_idx = -EINVAL;
+    struct nl_msg *msg;
+
+    if (!nl_global)
+        return -EINVAL;
+
+    if ((phy_idx = util_sys_phyname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_SET_WIPHY, false);
+    if (!msg)
+        return -EINVAL;
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_ANTENNA_TX, tx_antenna);
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_ANTENNA_RX, rx_antenna);
+    nlmsg_send_and_recv(nl_global, msg, NULL, NULL);
+
+    return 0;
+}
+
 char *dfs_state_string(enum nl80211_dfs_state state)
 {
     switch (state) {
@@ -286,6 +375,7 @@ int nl_req_get_channels(struct nl_global_info *nl_global,
 
     nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
     nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+    nlmsg_hdr(msg)->nlmsg_flags |= NLM_F_DUMP;
 
     nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_channels, &chan_buf);
 
@@ -379,6 +469,8 @@ int nl_req_init_channels(struct nl_global_info *nl_global,
     }
 
     nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+
+    nlmsg_hdr(msg)->nlmsg_flags |= NLM_F_DUMP;
 
     nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_init_channels, chan_status);
 
@@ -496,27 +588,39 @@ int nl_resp_parse_iface_supp_band(struct nl_msg *msg, void *arg)
         nla_for_each_nested(nl_band, tb[NL80211_ATTR_WIPHY_BANDS], rem_band) {
             struct nlattr *tb_band[NL80211_BAND_ATTR_MAX + 1];
 
-            nla_parse(tb_band, NL80211_BAND_ATTR_MAX, nla_data(nl_band), nla_len(nl_band), NULL);
-            if (tb_band[NL80211_BAND_ATTR_FREQS]) {
-                struct nlattr *tb_freq[NL80211_FREQUENCY_ATTR_MAX + 1];
-                struct nlattr *nl_freq = NULL;
-                int rem_freq = 0;
+            if (nl_band->nla_type == NL80211_BAND_2GHZ) {
+                *flags = CHAN_2GHZ;
+            } else if (nl_band->nla_type == NL80211_BAND_6GHZ) {
+                *flags = CHAN_6GHZ;
+            } else {
+                nla_parse(tb_band, NL80211_BAND_ATTR_MAX, nla_data(nl_band), nla_len(nl_band), NULL);
+                if (tb_band[NL80211_BAND_ATTR_FREQS]) {
+                    struct nlattr *tb_freq[NL80211_FREQUENCY_ATTR_MAX + 1];
+                    struct nlattr *nl_freq = NULL;
+                    int rem_freq = 0;
 
-                nla_for_each_nested(nl_freq, tb_band[NL80211_BAND_ATTR_FREQS], rem_freq) {
-                    static struct nla_policy freq_policy[NL80211_FREQUENCY_ATTR_MAX + 1] = {
-                        [NL80211_FREQUENCY_ATTR_FREQ] = { .type = NLA_U32 },
-                        [NL80211_FREQUENCY_ATTR_DISABLED] = { .type = NLA_FLAG },
-                    };
+                    nla_for_each_nested(nl_freq, tb_band[NL80211_BAND_ATTR_FREQS], rem_freq) {
+                        static struct nla_policy freq_policy[NL80211_FREQUENCY_ATTR_MAX + 1] = {
+                            [NL80211_FREQUENCY_ATTR_FREQ] = { .type = NLA_U32 },
+                            [NL80211_FREQUENCY_ATTR_DISABLED] = { .type = NLA_FLAG },
+                        };
 
-                    nla_parse(tb_freq, NL80211_FREQUENCY_ATTR_MAX, nla_data(nl_freq), nla_len(nl_freq), freq_policy);
-                    if (!tb_freq[NL80211_FREQUENCY_ATTR_FREQ])
-                        continue;
-                    if (tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
-                        continue;
+                        nla_parse(tb_freq, NL80211_FREQUENCY_ATTR_MAX, nla_data(nl_freq), nla_len(nl_freq), freq_policy);
+                        if (!tb_freq[NL80211_FREQUENCY_ATTR_FREQ])
+                            continue;
+                        if (tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
+                            continue;
 
-                    channel = util_freq_to_chan(nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_FREQ]));
-                    chan_classify(channel, &chan_flag);
-                    *flags = chan_flag;
+                        channel = util_freq_to_chan(nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_FREQ]));
+                        chan_classify(channel, &chan_flag);
+                        if (*flags == -EINVAL) {
+                            // first time the call back function is called
+                            *flags = chan_flag;
+                        } else {
+                            // combine with the last channel parsing result
+                            *flags |= chan_flag;
+                        }
+                    }
                 }
             }
         }
@@ -543,9 +647,117 @@ int nl_req_get_iface_supp_band(struct nl_global_info *nl_global, const char *ifn
 
     nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
 
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+
+    nlmsg_hdr(msg)->nlmsg_flags |= NLM_F_DUMP;
+
     nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_iface_supp_band, &flags);
 
     return flags;
+}
+
+int nl_resp_parse_iface_ht_capa(struct nl_msg *msg, void *arg)
+{
+    int *ht_capa = arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (tb[NL80211_ATTR_WIPHY_BANDS]) {
+        struct nlattr *nl_band = NULL;
+        int rem_band = 0;
+
+        nla_for_each_nested(nl_band, tb[NL80211_ATTR_WIPHY_BANDS], rem_band) {
+            struct nlattr *tb_band[NL80211_BAND_ATTR_MAX + 1];
+            nla_parse(tb_band, NL80211_BAND_ATTR_MAX, nla_data(nl_band), nla_len(nl_band), NULL);
+            if (tb_band[NL80211_BAND_ATTR_HT_CAPA]) {
+                *ht_capa = nla_get_u32(tb_band[NL80211_BAND_ATTR_HT_CAPA]);
+            }
+        }
+    }
+
+    return NL_SKIP;
+}
+
+int nl_req_get_iface_ht_capa(struct nl_global_info *nl_global, const char *ifname)
+{
+    struct nl_msg *msg;
+    int htCapa = -EINVAL;
+    int phy_idx = -EINVAL;
+
+    if (!nl_global)
+        return -EINVAL;
+
+    if ((phy_idx = util_sys_phyname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_WIPHY, false);
+    if (!msg)
+        return -ENOMEM;
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+
+    nlmsg_hdr(msg)->nlmsg_flags |= NLM_F_DUMP;
+
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_iface_ht_capa, &htCapa);
+
+    return htCapa;
+}
+
+int nl_resp_parse_iface_vht_capa(struct nl_msg *msg, void *arg)
+{
+    int *vht_capa = arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+
+    memset(tb, 0, sizeof(tb));
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+
+    if (tb[NL80211_ATTR_WIPHY_BANDS]) {
+        struct nlattr *nl_band = NULL;
+        int rem_band = 0;
+
+        nla_for_each_nested(nl_band, tb[NL80211_ATTR_WIPHY_BANDS], rem_band) {
+            struct nlattr *tb_band[NL80211_BAND_ATTR_MAX + 1];
+            nla_parse(tb_band, NL80211_BAND_ATTR_MAX, nla_data(nl_band), nla_len(nl_band), NULL);
+            if (tb_band[NL80211_BAND_ATTR_VHT_CAPA]) {
+                *vht_capa = nla_get_u32(tb_band[NL80211_BAND_ATTR_VHT_CAPA]);
+            }
+        }
+    }
+
+    return NL_SKIP;
+}
+
+int nl_req_get_iface_vht_capa(struct nl_global_info *nl_global, const char *ifname)
+{
+    struct nl_msg *msg;
+    int vhtCapa = -EINVAL;
+    int phy_idx = -EINVAL;
+
+    if (!nl_global)
+        return -EINVAL;
+
+    if ((phy_idx = util_sys_phyname_to_idx(ifname)) < 0)
+        return -EINVAL;
+
+    msg = nlmsg_init(nl_global, NL80211_CMD_GET_WIPHY, false);
+    if (!msg)
+        return -ENOMEM;
+
+    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
+
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+
+    nlmsg_hdr(msg)->nlmsg_flags |= NLM_F_DUMP;
+
+    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_iface_vht_capa, &vhtCapa);
+
+    return vhtCapa;
 }
 
 int nl_req_set_reg_dom(struct nl_global_info *nl_global, char *country_code)

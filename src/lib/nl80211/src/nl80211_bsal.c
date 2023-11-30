@@ -76,43 +76,8 @@ int nl_req_get_ssid(struct nl_global_info *bsal_nl_global, const char *ifname, c
     return nlmsg_send_and_recv(bsal_nl_global, msg, nl_resp_parse_ssid, ssid);
 }
 
-int nl_resp_parse_noise(struct nl_msg *msg, void *arg)
-{
-    struct noise_info *noise_info = (struct noise_info *) arg;
-    struct nlattr *tb[NL80211_ATTR_MAX + 1];
-    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
-    struct nlattr *infoattr[NL80211_SURVEY_INFO_MAX + 1];
-    static struct nla_policy s_policy[NL80211_SURVEY_INFO_MAX + 1] = {
-        [NL80211_SURVEY_INFO_FREQUENCY] = { .type = NLA_U32 },
-        [NL80211_SURVEY_INFO_NOISE]     = { .type = NLA_U8 },
-    };
-
-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
-
-    if (!tb[NL80211_ATTR_SURVEY_INFO])
-        return NL_SKIP;
-
-    if (nla_parse_nested(infoattr, NL80211_SURVEY_INFO_MAX, tb[NL80211_ATTR_SURVEY_INFO], s_policy))
-        return NL_SKIP;
-
-    if (!infoattr[NL80211_SURVEY_INFO_FREQUENCY])
-        return NL_SKIP;
-
-    if (util_freq_to_chan(nla_get_u32(infoattr[NL80211_SURVEY_INFO_FREQUENCY])) != noise_info->chan)
-        return NL_SKIP;
-
-    if (!infoattr[NL80211_SURVEY_INFO_NOISE])
-        return NL_SKIP;
-
-    noise_info->noise = (int8_t) nla_get_u8(infoattr[NL80211_SURVEY_INFO_NOISE]);
-    LOGD("%s: noise %d dBm", __func__, noise_info->noise);
-
-    return NL_SKIP;
-}
-
 int rssi_to_snr(struct nl_global_info *nl_global, int if_idx, int rssi)
 {
-    struct nl_msg *msg;
     struct noise_info noise_info = { 0 };
 
     if (if_idx < 0) {
@@ -121,20 +86,9 @@ int rssi_to_snr(struct nl_global_info *nl_global, int if_idx, int rssi)
     }
 
     noise_info.chan = nl_req_get_iface_curr_chan(nl_global, if_idx);
-    if (noise_info.chan <= 0 || noise_info.chan >= IEEE80211_CHAN_MAX)
-        return (rssi - DEFAULT_NOISE_FLOOR);
+    noise_info.noise = util_get_curr_chan_noise(nl_global, if_idx, noise_info.chan);
 
-    msg = nlmsg_init(nl_global, NL80211_CMD_GET_SURVEY, true);
-    if (!msg)
-        return (rssi - DEFAULT_NOISE_FLOOR);
-
-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_idx);
-
-    nlmsg_send_and_recv(nl_global, msg, nl_resp_parse_noise, &noise_info);
-    if (noise_info.noise)
-        return (rssi - noise_info.noise);
-
-    return (rssi - DEFAULT_NOISE_FLOOR);
+    return (rssi - noise_info.noise);
 }
 
 int nl_resp_parse_sta_rssi(struct nl_msg *msg, void *arg)
@@ -243,7 +197,7 @@ int nl_resp_parse_sta_info(struct nl_msg *msg, void *arg)
         memcpy(data->assoc_ies, nla_data(tb[NL80211_ATTR_IE]), ies_len);
         data->assoc_ies_len = ies_len;
     } else if (ies_len > sizeof(data->assoc_ies)) {
-        LOGI("%s: received assoc ie length[%d] exceeds bsal assoc_ies buffer len[%d]",
+        LOGI("%s: received assoc ie length[%zd] exceeds bsal assoc_ies buffer len[%zu]",
              __func__, ies_len, sizeof(data->assoc_ies));
     }
     return NL_OK;

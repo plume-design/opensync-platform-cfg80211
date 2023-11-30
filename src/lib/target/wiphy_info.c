@@ -50,13 +50,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "util.h"
 #include "target_nl80211.h"
 
-/* local types */
-enum {
-    CHAN_2GHZ = 1 << 0,
-    CHAN_5GHZ_LOWER = 1 << 1,
-    CHAN_5GHZ_UPPER = 1 << 2,
-};
-
 /* static data */
 static const char *wiphy_prefix = CONFIG_MAC80211_WIPHY_PREFIX;
 #define TARGET_WIPHY_PATH CONFIG_MAC80211_WIPHY_PATH
@@ -68,22 +61,18 @@ static const struct {
     const char *chip;
     const char *codename;
 } g_chips[] = {
-    { 0x003c, 0x168c, 0, "qca9882", "Peregrine" },
-    { 0x0050, 0x168c, 0, "qca9887", "Swift" },
-    { 0x0040, 0x168c, 0, "qca99x0", "Beeliner" },
-    { 0x0046, 0x168c, 0, "qca9984", "Cascade" },
-    { 0x0056, 0x168c, 0, "qca9888", "Besra" },
-    { 0x0056, 0x168c, "qcom,ath10k", "qca9886", "Besra" },
-    { 0, 0, "qcom,ipq4019-wifi", "qca4019", "Dakota" },
-    { 0, 0, "qca,wifi-ipq40xx", "qca4019", "Dakota" },
+    // QCA
+    { 0, 0, "qcom,ipq4019-wifi", "qca4019", "Dakota"},
     { 0, 0, "qcom,cnss-qca6018", "qca6018", "Cypress"},
-    { 0, 0, "qca,wifi-ar956x", "qca9563", "Dragonfly" },
-    { 0, 0, "qcom,cnss-qca8074", "qca8074", "Hawkeye" },
-    { 0, 0, "qcom,cnss-qca8074v2", "qca8074", "Hawkeye" },
-    { 0, 0, "mediatek,mt7622-wmac", "mt7622", "Mediatek" },
-    { 0, 0, "mediatek,wbsys", "mt7986", "Mediatek" },
-    { 0x7915, 0x14c3, 0, "mt7915", "Mediatek" },
-    { 0x7615, 0x14c3, 0, "mt7615", "Mediatek" },
+    { 0x0056, 0x168c, "qcom,ath10k", "qca9886", "Besra"},
+    // MTK
+    { 0, 0, "mediatek,mt7622-wmac", "mt7622", "MediaTek"},
+    { 0, 0, "mediatek,wbsys", "mt7986", "Filogic830(Panther)"},
+    { 0, 0, "mediatek,mt7988-wbsys", "mt7988", "Filogic880(Jaguar)"},
+    { 0x7615, 0x14c3, 0, "mt7615", "MediaTek"},
+    { 0x7915, 0x14c3, 0, "mt7915", "Filogic615(Harrier)"},
+    { 0x7906, 0x14c3, "ecnt,pcie-ecnt", "mt7916", "Filogic630(Merlin)"},
+    { 0x7990, 0x14c3, 0, "mt7996", "Filogic680(Eagle)"},
 };
 
 /* runtime data */
@@ -199,6 +188,8 @@ chan_get_band_str(int flags)
         return "5GL";
     else if (flags & CHAN_5GHZ_UPPER)
         return "5GU";
+    else if (flags & CHAN_6GHZ)
+        return "6G";
 
     WARN_ON(1);
     return NULL;
@@ -213,6 +204,7 @@ identify_band_nl80211(struct nl_global_info *nl_global,
 
     if ((flags = nl_req_get_iface_supp_band(nl_global, phyname)) > 0) {
         *band = chan_get_band_str(flags);
+        LOGI("identify band: %s", *band);
     }
 
     return *band ? 0 : -ENOENT;
@@ -265,7 +257,27 @@ wiphy_info_init_ifname(struct nl_global_info *nl_global, const char *phyname)
     if (WARN_ON(!info->band))
         return -1;
 
-    info->mode = "11ac";
+    if (!strcmp(info->chip, "mt7996")) {
+        // Wifi 7
+        info->mode = "11be";
+    } else if (!strcmp(info->chip, "mt7915") ||
+               !strcmp(info->chip, "mt7916") ||
+               !strcmp(info->chip, "mt7986")) {
+        // Wifi 6/6E
+        info->mode = "11ax";
+    } else if (!strcmp(info->chip, "qca4019") ||
+               !strcmp(info->chip, "qca6018") ||
+               !strcmp(info->chip, "qca9886") ||
+               !strcmp(info->chip, "mt7615")) {
+        // Wifi 5
+        if (strstr(info->band, "5G") == info->band)
+            info->mode = "11ac";  // 5G, 5GL, 5GU
+        else if (!strcmp(info->band, "2.4G"))
+            info->mode = "11n";
+    } else if (!strcmp(info->chip, "mt7622")) {
+        // Wifi 4
+        info->mode = "11n";
+    }
 
     if (!strcmp(info->band, "2.4G"))
         STRSCPY(g_wiphy_2ghz_ifname, phyname);
@@ -299,6 +311,8 @@ wiphy_info_get(const char *ifname)
         return NULL;
     if (WARN_ON(!info->mode))
         return NULL;
+
+    LOGD("%s: wiphy_info_get: chip=%s codename=%s band=%s mode=%s", ifname, info->chip, info->codename, info->band, info->mode);
 
     return info;
 }
