@@ -331,14 +331,54 @@ bool hostapd_get_mac_acl_info(const char *phy,
     else
         buf = strdupa(accept_buf);
 
-    while ((line = strsep(&buf, "\n")) != NULL)
-        if ((mac_addr = strsep(&line, " ")) != NULL)
+    while ((line = strsep(&buf, "\n")) != NULL) {
+        if ((mac_addr = strsep(&line, " ")) != NULL) {
             if (strlen(mac_addr) > 0) {
-                STRSCPY(vstate->mac_list[vstate->mac_list_len], mac_addr);
-                vstate->mac_list_len++;
+                if ((unsigned long) vstate->mac_list_len < ARRAY_SIZE(vstate->mac_list)) {
+                    STRSCPY(vstate->mac_list[vstate->mac_list_len], mac_addr);
+                    vstate->mac_list_len++;
+                } else {
+                    LOGW("ACL rule entries over the size of mac_list, skip MAC %s", mac_addr);
+                }
             }
-
+        }
+    }
     return true;
+}
+
+bool hostapd_set_bcn_int(const char *phy, const char *vif, const int bcn_int)
+{
+    char    hostapd_cmd[1024];
+    bool    ret = false;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s "
+            "set beacon_int %d",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, bcn_int);
+
+    ret = !cmd_log(hostapd_cmd);
+    if (!ret) {
+        LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+    }
+
+    return ret;
+}
+
+bool hostapd_vif_reload(const char *phy, const char *vif)
+{
+    char    hostapd_cmd[1024];
+    bool    ret = false;
+
+    snprintf(hostapd_cmd, sizeof(hostapd_cmd),
+            "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s reload",
+            HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
+
+    ret = !cmd_log(hostapd_cmd);
+    if (!ret) {
+        LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
+    }
+
+    return ret;
 }
 
 bool hostapd_get_vif_status(const char *vif, const char *key, char *value)

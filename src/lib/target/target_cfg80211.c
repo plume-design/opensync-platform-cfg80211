@@ -2346,6 +2346,41 @@ static bool util_get_center_freq0_chan(const char *phy, int *val)
 }
 #endif
 
+static void util_set_bcn_int(const char *phy, const int bcn_int)
+{
+    char ap_vif_curr_bcn_int_str[BFR_SIZE_64] = "";
+    int ap_vif_curr_bcn_int = 0;
+    char ap_vif_list[BFR_SIZE_128] = "";
+    char *p_ap_vif_list = ap_vif_list;
+    char vif[BFR_SIZE_32] = "";
+    const char *ap_vif = NULL;
+
+    if (util_wifi_get_all_phy_vif_type(phy, ap_vif_list, sizeof(ap_vif_list), IFNAME_TYPE_AP)) {
+        LOGW("%s: no ap vaps, bcn_int %d will be set on first vap if possible", phy, bcn_int);
+        return;
+    }
+
+    while ((ap_vif = strsep(&p_ap_vif_list, " "))) {
+        if (hostapd_get_vif_status(ap_vif, "beacon_int", ap_vif_curr_bcn_int_str)) {
+            ap_vif_curr_bcn_int = atoi(ap_vif_curr_bcn_int_str);
+            if (bcn_int == ap_vif_curr_bcn_int) {
+                LOGI("%s: already in newly requested bcn_int %d", ap_vif, bcn_int);
+            } else {
+                strscpy(vif, ap_vif, strlen(ap_vif) + 1);
+                LOGI("%s: update bcn_int: %d -> %d", ap_vif, ap_vif_curr_bcn_int, bcn_int);
+                if (hostapd_set_bcn_int(phy, vif, bcn_int)) {
+                    if (!hostapd_vif_reload(phy, vif))
+                        LOGE("%s: failed to vif reload", vif);
+                } else {
+                    LOGE("%s: failed to set bcn_int to %d", vif, bcn_int);
+                }
+            }
+        }
+    }
+
+    return;
+}
+
 static bool util_get_bcn_int(const char *phy, int *val)
 {
     char ap_vif[BFR_SIZE_64];
@@ -2601,6 +2636,7 @@ util_nl_parse(const void *buf, unsigned int len)
     int attrlen;
     bool created;
     bool deleted;
+    bool updated;
 
     util_nl_each_msg(buf, hdr, len)
         if (hdr->nlmsg_type == RTM_NEWLINK ||
@@ -2618,13 +2654,12 @@ util_nl_parse(const void *buf, unsigned int len)
 
             ifm = NLMSG_DATA(hdr);
             created = (hdr->nlmsg_type == RTM_NEWLINK) && (ifm->ifi_change == ~0U);
+            updated = (hdr->nlmsg_type == RTM_NEWLINK) && (ifm->ifi_change & IFF_UP);
             deleted = (hdr->nlmsg_type == RTM_DELLINK);
-            if ((created || deleted) &&
-                (access(F("/sys/class/net/%s", ifname), R_OK) == 0))
+            if ((created || updated || deleted) &&
+                (access(F("/sys/class/net/%s/wireless", ifname), R_OK) == 0))
                 util_cb_delayed_update(UTIL_CB_VIF, ifname);
             if (deleted && util_wifi_is_ap_vlan(ifname))
-                util_cb_delayed_update(UTIL_CB_VIF, ifname);
-            if (ifm->ifi_change == IFF_UP)
                 util_cb_delayed_update(UTIL_CB_VIF, ifname);
         }
 }
@@ -3043,7 +3078,6 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
     int     ap_vif_curr_chan = 0;
     char    ap_vif_curr_htmode[BFR_SIZE_32] = "";
     char    ap_vif_list[BFR_SIZE_128] = "";
-    char    sta_vif_list[BFR_SIZE_128] = "";
     char    *p_ap_vif_list = ap_vif_list;
     char    vif[BFR_SIZE_32] = "";
     bool    update_channel = false;
@@ -3060,16 +3094,10 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
             if ((rconf->channel == ap_vif_curr_chan) && (!strcmp(rconf->ht_mode, ap_vif_curr_htmode)))
                 LOGN("%s: already in newly requested channel and htmode", __func__);
             else {
-                if ((!util_wifi_get_all_phy_vif_type(phy, sta_vif_list, sizeof(sta_vif_list), IFNAME_TYPE_STA)) &&
-                    (rconf->channel == ap_vif_curr_chan) &&
-                    (strcmp(rconf->ht_mode, ap_vif_curr_htmode) != 0))
-                    LOGN("%s: htmode reconfig not supported when bhaul-sta is connected on same radio", __func__);
-                else {
-                    update_channel = true;
-                    strscpy(vif, ap_vif, strlen(ap_vif) + 1);
-                    LOGN("%s: update channel:%d -> %d, htmode:%s -> %s", ap_vif, ap_vif_curr_chan, rconf->channel,
-                        ap_vif_curr_htmode, rconf->ht_mode);
-                }
+                update_channel = true;
+                strscpy(vif, ap_vif, strlen(ap_vif) + 1);
+                LOGN("%s: update channel:%d -> %d, htmode:%s -> %s", ap_vif, ap_vif_curr_chan, rconf->channel,
+                    ap_vif_curr_htmode, rconf->ht_mode);
             }
         } else if (ap_vif_curr_chan == 0)
             hapd_reload_ap_vif(rconf, ap_vif);
@@ -3123,6 +3151,9 @@ target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
             if (util_channel_switch(rconf, phy) < 0)
                 LOGN("%s: error received while trying to set new channel/ht_mode", __func__);
     }
+
+    if (changed->bcn_int)
+        util_set_bcn_int(phy, rconf->bcn_int);
 
     if (changed->fallback_parents)
         util_radio_fallback_parents_set(phy, rconf);

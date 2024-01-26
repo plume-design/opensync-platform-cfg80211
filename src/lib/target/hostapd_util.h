@@ -94,6 +94,8 @@ bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_
 
 int hostapd_mac_acl_clear(const char *phy, const char *vif);
 
+bool hostapd_set_bcn_int(const char *phy, const char *vif, const int bcn_int);
+bool hostapd_vif_reload(const char *phy, const char *vif);
 bool hostapd_get_vif_status(const char *vif, const char *key, char *value);
 
 int hostapd_chan_switch(
