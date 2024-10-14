@@ -29,6 +29,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "nl80211_stats.h"
 #include "target_nl80211.h"
 #include <string.h>
+#include "kconfig.h"
 
 #include <ev.h>
 #include <linux/nl80211.h>
@@ -708,7 +709,10 @@ bool nl80211_stats_scan_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
     {
         if ((if_index = util_sys_ifname_to_idx(nl_call_param.ifname)) >= 0)
         {
-            chan_noise = util_get_curr_chan_noise(nl_sm_global, if_index, chan_list[0]);
+            if (kconfig_enabled(CONFIG_TARGE_USE_STATIC_NF))
+                chan_noise = DEFAULT_NOISE_FLOOR;
+            else
+                chan_noise = util_get_curr_chan_noise(nl_sm_global, if_index, chan_list[0]);
         }
     }
 
@@ -723,14 +727,15 @@ bool nl80211_stats_scan_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
             LOGT("Found negative signal/noise ratio %d, forcing value to 0", neighbor->entry.sig);
             neighbor->entry.sig = 0;
         }
-        LOGT("%s Parsed %s SSID %s {bssid %s, chan %u, chanwidth %d, signal %d}",
+        LOGT("%s Parsed %s SSID %s {bssid %s, chan %u, chanwidth %d, signal %d, chan_noise %d}",
          __func__,
         radio_get_name_from_type(nl_call_param.type),
         neighbor->entry.ssid,
         neighbor->entry.bssid,
         neighbor->entry.chan,
         neighbor->entry.chanwidth,
-        neighbor->entry.sig);
+        neighbor->entry.sig,
+        chan_noise);
     }
 
     LOGT("Parsed %s %s scan results for channel %d",

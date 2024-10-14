@@ -2407,6 +2407,7 @@ util_hapd_conf_param_set(struct hapd *hapd,
     size_t len = sizeof(hapd->conf);
     char *buf = hapd->conf;
     size_t len_used;
+    char mac_addr[32];
 
     len_used = strnlen(buf, len);
     if (WARN_ON(len_used == len))
@@ -2429,6 +2430,9 @@ util_hapd_conf_param_set(struct hapd *hapd,
 
     if (rconf->bcn_int_exists)
         csnprintf(&buf, &len, "beacon_int=%d\n", rconf->bcn_int);
+
+    if (util_net_get_macaddr_str(vconf->if_name, mac_addr, sizeof(mac_addr)) == 0)
+        csnprintf(&buf, &len, "bssid=%s\n", mac_addr);
 
     if (kconfig_enabled(CONFIG_PLATFORM_IS_MTK))
     {
@@ -2912,24 +2916,17 @@ static bool
 util_radio_ht_mode_get(const char *phy, char *htmode, int htmode_len)
 {
     char vif[BFR_SIZE_64] = "";
-    struct schema_Wifi_Radio_Config rconf;
 
     if (util_wifi_get_phy_any_vif_type(phy, vif, sizeof(vif), IFNAME_TYPE_AP)) {
         LOGD("%s: get ap vif failed for ht mode", phy);
-        goto rconf_chan;
+        memset(vif, 0, sizeof(vif));
+        if (util_wifi_get_phy_any_vif_type(phy, vif, sizeof(vif), IFNAME_TYPE_STA)) {
+            LOGD("%s: get vif failed for ht mode", phy);
+            return false;
+        }
     }
 
     return util_vif_ht_mode_get(vif, htmode, htmode_len);
-
-rconf_chan:
-    if (util_lookup_rconf_by_ifname(&rconf, phy)) {
-        LOGD("%s: lookup rconf ht mode %s", phy, rconf.ht_mode);
-        strscpy(htmode, rconf.ht_mode, htmode_len);
-        return true;
-    }
-
-    LOGT("%s: get ht mode failed", phy);
-    return false;
 }
 
 static bool

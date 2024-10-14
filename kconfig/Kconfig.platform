@@ -4,6 +4,12 @@ menuconfig NL80211_INTERFACE_LAYER
     help
         Enable NL80211 interface abstraction layer
 
+menuconfig TARGE_USE_STATIC_NF
+    bool "Use Static Noise Floor to Calculate SNR"
+    default y
+    help
+        Add support for using static noise floor to calculate SNR
+
 config MAC80211_WIPHY_PREFIX
     string "mac80211 wiphy prefix"
     default "phy"

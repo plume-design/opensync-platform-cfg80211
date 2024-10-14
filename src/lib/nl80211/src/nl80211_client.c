@@ -29,6 +29,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "nl80211_stats.h"
 #include "target_nl80211.h"
 #include <string.h>
+#include "kconfig.h"
 
 #include <ev.h>
 #include <linux/nl80211.h>
@@ -216,7 +217,12 @@ static int nl80211_get_assoclist(struct nl_global_info *nl_sm_global,
     }
 
     int chan = nl_req_get_iface_curr_chan(nl_sm_global, if_index);
-    int chan_noise = util_get_curr_chan_noise(nl_sm_global, if_index, chan);
+    int chan_noise;
+
+    if (kconfig_enabled(CONFIG_TARGE_USE_STATIC_NF))
+        chan_noise = DEFAULT_NOISE_FLOOR;
+    else
+        chan_noise = util_get_curr_chan_noise(nl_sm_global, if_index, chan);
 
     for (client_entry = ds_dlist_ifirst(&record_iter, nl_call_param->list);
             client_entry != NULL;

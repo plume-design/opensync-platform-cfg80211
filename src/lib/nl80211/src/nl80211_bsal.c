@@ -26,6 +26,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define _GNU_SOURCE
 #include "nl80211.h"
+#include "kconfig.h"
 #include <linux/nl80211.h>
 #include <netlink/msg.h>
 #include <netlink/attr.h>
@@ -86,7 +87,11 @@ int rssi_to_snr(struct nl_global_info *nl_global, int if_idx, int rssi)
     }
 
     noise_info.chan = nl_req_get_iface_curr_chan(nl_global, if_idx);
-    noise_info.noise = util_get_curr_chan_noise(nl_global, if_idx, noise_info.chan);
+
+    if (kconfig_enabled(CONFIG_TARGE_USE_STATIC_NF))
+        noise_info.noise = DEFAULT_NOISE_FLOOR;
+    else
+        noise_info.noise = util_get_curr_chan_noise(nl_global, if_idx, noise_info.chan);
 
     return (rssi - noise_info.noise);
 }
