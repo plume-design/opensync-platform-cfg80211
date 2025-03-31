@@ -24,11 +24,31 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# {# jinja-parse #}
 
-for iface in {{CONFIG_WIFI_UNUSED_IFACE_LIST}}
-do
-    echo -e "Deleting $iface\n"
-    iw $iface del > /dev/null
-done
+HNAT_DIR=/sys/kernel/debug/hnat
+HNAT_CONFIG=hnat_setting
 
+# ====================Advanced Settings====================
+# Usage: echo [type] [option] > /sys/kernel/debug/hnat/hnat_setting
+#
+# Commands:   [type] [option]
+#               0     0~7        Set debug_level(0~7), current debug_level=0
+#               1     0~65535    Set binding threshold
+#               2     0~65535    Set TCP bind lifetime
+#               3     0~65535    Set FIN bind lifetime
+#               4     0~65535    Set UDP bind lifetime
+#               5     0~255      Set TCP keep alive interval
+#               6     0~255      Set UDP keep alive interval
+#               7     0~1        Set hnat counter update to nf_conntrack
+#               8     0~6        Set PPE hash debug mode
+#               9     0~4G       Set hnat counter update interval in ms (0 disabled)
+
+if [ -e  $HNAT_DIR/$HNAT_CONFIG ]; then
+	echo 7 0 > $HNAT_DIR/$HNAT_CONFIG
+
+	echo 2 2 > $HNAT_DIR/$HNAT_CONFIG
+	echo 3 2 > $HNAT_DIR/$HNAT_CONFIG
+	echo 4 2 > $HNAT_DIR/$HNAT_CONFIG
+
+	echo 9 1000 > $HNAT_DIR/$HNAT_CONFIG
+fi

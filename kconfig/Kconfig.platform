@@ -51,8 +51,28 @@ menuconfig PLATFORM_IS_MTK
         Support for MediaTek platform
 
 if PLATFORM_IS_MTK
+config MTK_HW_ACC_HNAT
+    bool "HNAT acceleration engine"
+    default n
+    help
+        Use HNAT acceleration engine.
+
+config MTK_HW_ACC_HNAT_FLUSH_PATH
+    depends on MTK_HW_ACC_HNAT
+    string "HNAT connection flush debug param"
+    default "/sys/kernel/debug/hnat/hnat_entry"
+    help
+        Use this for flushing connection from HNAT AE.
+
+config MTK_HW_ACC_HNAT_ENABLE_PATH
+    depends on MTK_HW_ACC_HNAT
+    string "HNAT enable/disable AE debug param"
+    default "/sys/kernel/debug/hnat/hook_toggle"
+    help
+        Use this for enabling/disabling HNAT AE.
 
 config MTK_HW_ACC_FILE_PATH
+    depends on !MTK_HW_ACC_HNAT
     string "Hardware acceleration file path"
     default "/sys/kernel/debug/xt_flowoffload/flush"
     help

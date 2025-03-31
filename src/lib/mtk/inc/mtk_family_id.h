@@ -24,9 +24,12 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef NL80211_DEVICE_H_INCLUDED
-#define NL80211_DEVICE_H_INCLUDED
+#ifndef MTK_FAMILY_ID_H_INCLUDED
+#define MTK_FAMILY_ID_H_INCLUDED
 
-int nl80211_get_tx_chainmask(char *ifname, unsigned int *mask);
+#include <netlink/msg.h>
 
-#endif /* NL80211_DEVICE_H_INCLUDED */
+struct nl_msg *mtk_family_id_msg(void);
+int mtk_family_id_parse(struct nl_msg *resp);
+
+#endif /* MTK_FAMILY_ID_H_INCLUDED */

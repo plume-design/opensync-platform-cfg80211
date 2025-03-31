@@ -18,4 +18,3 @@ UNIT_DEPS_CFLAGS := src/lib/target
 UNIT_DEPS += src/lib/common
 UNIT_DEPS += src/lib/ds
 UNIT_DEPS += src/lib/const
-UNIT_DEPS += src/lib/evsched

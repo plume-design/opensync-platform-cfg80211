@@ -72,7 +72,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "log.h"
 #include "const.h"
 #include "os_nif.h"
-#include "evsched.h"
 #include "ds_tree.h"
 
 #include "target.h"
@@ -89,6 +88,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "wpa_ctrl.h"
 #include "kconfig.h"
 #include "ovsdb_sync.h"
+#include "util.h"
 
 /***************************************************************************************/
 
@@ -129,6 +129,14 @@ struct ieee80211_mgmt {
             uint8_t variable[];
         } reassoc_req;
     } u;
+};
+
+#define BSAL_HOSTAP_CTRL_MAX_RETRY 60
+
+struct bsal_hostap_ctrl_try {
+    struct ctrl *ctrl;
+    ev_timer timer;
+    int retry_cnt;
 };
 
 #define for_each_element(_elem, _data, _datalen)                        \
@@ -1020,6 +1028,22 @@ static void bsal_hapd_frame_probe_req(struct hapd *hapd, const char *buf)
     return;
 }
 
+static void bsal_hapd_retry_ctrl_cb(EV_P_ ev_timer *timer, int events) {
+    struct bsal_hostap_ctrl_try *retry = container_of(timer, struct bsal_hostap_ctrl_try, timer);
+    struct ctrl *ctrl = retry->ctrl;
+
+    LOGD("%s: bsal retrying", ctrl->bss);
+
+    if ((ctrl_request_ok(ctrl, "ATTACH osync_bm_rx_mgmt=1")) ||
+        (++retry->retry_cnt == BSAL_HOSTAP_CTRL_MAX_RETRY)) {
+        ev_timer_stop(EV_DEFAULT_ &retry->timer);
+        FREE(retry);
+        return;
+    }
+
+    ev_timer_again(EV_DEFAULT_ timer);
+}
+
 static void
 bsal_hapd_ctrl_cb(struct ctrl *ctrl, int level, const char *buf, size_t len)
 {
@@ -1082,6 +1106,15 @@ bsal_hapd_ctrl_cb(struct ctrl *ctrl, int level, const char *buf, size_t len)
 
 
     LOGD("%s: event: <%d> %s", ctrl->bss, level, buf);
+
+    if (!strncmp(buf, WPA_EVENT_TERMINATING, strlen(WPA_EVENT_TERMINATING))) {
+        struct bsal_hostap_ctrl_try *try = calloc(1, sizeof(struct bsal_hostap_ctrl_try));
+        if (try) {
+            try->ctrl = ctrl;
+            ev_timer_init(&try->timer, bsal_hapd_retry_ctrl_cb, 0., 5.);
+            ev_timer_again(EV_DEFAULT_ &try->timer);
+        }
+    }
 }
 
 static bool is_onewifi_enabled()
@@ -1128,8 +1161,11 @@ static int hostap_init_bss(const char *bss)
     hapd->cmd_frame_disconnect = bsal_hapd_frame_disconnect;
 #endif
 
-    if (!ctrl_enable(&hapd->ctrl))
+    if (!ctrl_enable(&hapd->ctrl)) {
         LOGI("%s: bsal hapd initialized for %s", __func__, bss);
+        /* Enbale osync_bm_rx_mgmt so that hapd allow send rx_mgmt NL_CMD_FRAME events */
+        WARN_ON(!ctrl_request_ok(&hapd->ctrl, "ATTACH osync_bm_rx_mgmt=1"));
+    }
 
     hapd = NULL;
 
@@ -1377,7 +1413,7 @@ static bool hapd_cli_bss_tm_request(
                  mac_str, neigh->bssid_info, neigh->op_class,
                  neigh->channel, neigh->phy_type);
 
-        strcat(neigh_list, cmd);
+        STRSCAT(neigh_list, cmd);
     }
 
     snprintf(btm_req_cmd, sizeof(btm_req_cmd),

@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Enable experimental feature flag enable_ofdma
+# Default value is disabled DL and UL OFDMA
+# When flag enable_ofdma is set then it enables DL and UL OFDMA
+# 0x1 DL OFDMA
+# 0x2 UL OFDMA
+
+for file in $(ls /sys/kernel/debug/ieee80211/phy*/mt76/muru_onoff)
+do
+    flags_hex=$(cat "$file")
+    flags=$(printf "%d" 0x$flags_hex)
+    if {{INSTALL_PREFIX}}/tools/osff_get "enable_ofdma"
+    then
+        echo $(($flags | 3)) > "$file"
+    else
+        echo $(($flags & ~3)) > "$file"
+    fi
+done

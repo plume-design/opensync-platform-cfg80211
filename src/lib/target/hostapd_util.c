@@ -42,6 +42,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "nl80211.h"
 #include "wiphy_info.h"
 #include "target_cfg80211.h"
+#include "util.h"
 
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
@@ -64,7 +65,7 @@ bool hostapd_client_disconnect(const char *vif, const char *disc_type, const cha
              "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s %s %s reason=%hhu",
              HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, disc_type, mac_str, reason);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret) {
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -85,7 +86,7 @@ bool hostapd_btm_request(const char *vif, const char *btm_req_cmd)
             "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s bss_tm_req %s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, btm_req_cmd);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret) {
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -109,7 +110,7 @@ bool hostapd_rrm_beacon_report_request(const char *vif,
             "req_beacon %s %s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac_addr, req_hex_buf);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret)
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
 
@@ -130,7 +131,7 @@ bool hostapd_rrm_set_neighbor(const char *vif, const char *bssid, const char *he
             "set_neighbor %s ssid=%s nr=%s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, bssid, hex_ssid, nr);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret) {
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -152,7 +153,7 @@ bool hostapd_rrm_remove_neighbor(const char *vif, const char *bssid)
             "remove_neighbor %s ",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, bssid);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret) {
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -188,7 +189,7 @@ bool hostapd_deny_acl_update(const char *vif, const uint8_t *mac_addr, int add)
             add ? "ADD_MAC" : "DEL_MAC", MAC_ADDRESS_PRINT(mac_addr));
 #endif
 
-    status = !cmd_log(hostapd_cmd);
+    status = !cmd_log_check_safe(hostapd_cmd);
     if (!status) {
         ret = false;
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
@@ -207,7 +208,7 @@ int hostapd_mac_acl_clear(const char *phy, const char *vif)
         "ACCEPT_ACL CLEAR",
         HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
 
-    status = !cmd_log(hostapd_cmd);
+    status = !cmd_log_check_safe(hostapd_cmd);
     if (!status)
         LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
 
@@ -216,7 +217,7 @@ int hostapd_mac_acl_clear(const char *phy, const char *vif)
         "DENY_ACL CLEAR",
         HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
 
-    status = !cmd_log(hostapd_cmd);
+    status = !cmd_log_check_safe(hostapd_cmd);
     if (!status)
         LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
 
@@ -238,7 +239,7 @@ bool hostapd_mac_acl_accept_add(const char *phy, const char *vif, const char *ma
         "SET macaddr_acl 1",
          HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
 
-    status = !cmd_log(hostapd_cmd);
+    status = !cmd_log_check_safe(hostapd_cmd);
     if (!status) {
         LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -249,7 +250,7 @@ bool hostapd_mac_acl_accept_add(const char *phy, const char *vif, const char *ma
             "ACCEPT_ACL ADD_MAC %s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac);
 
-        status = !cmd_log(hostapd_cmd);
+        status = !cmd_log_check_safe(hostapd_cmd);
         if (!status) {
             ret = false;
             LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
@@ -276,7 +277,7 @@ bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_
         "SET macaddr_acl 0",
          HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
 
-    status = !cmd_log(hostapd_cmd);
+    status = !cmd_log_check_safe(hostapd_cmd);
     if (!status) {
         LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -287,7 +288,7 @@ bool hostapd_mac_acl_deny_add(const char *phy, const char *vif, const char *mac_
             "DENY_ACL ADD_MAC %s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, mac);
 
-        status = !cmd_log(hostapd_cmd);
+        status = !cmd_log_check_safe(hostapd_cmd);
         if (!status) {
             ret = false;
             LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
@@ -356,7 +357,7 @@ bool hostapd_set_bcn_int(const char *phy, const char *vif, const int bcn_int)
             "set beacon_int %d",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif, bcn_int);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret) {
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -373,7 +374,7 @@ bool hostapd_vif_reload(const char *phy, const char *vif)
             "timeout -s KILL 5 hostapd_cli -p %s/hostapd-%s -i %s reload",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif);
 
-    ret = !cmd_log(hostapd_cmd);
+    ret = !cmd_log_check_safe(hostapd_cmd);
     if (!ret) {
         LOGE("hostapd_cli execution failed: %s", hostapd_cmd);
     }
@@ -381,7 +382,7 @@ bool hostapd_vif_reload(const char *phy, const char *vif)
     return ret;
 }
 
-bool hostapd_get_vif_status(const char *vif, const char *key, char *value)
+bool hostapd_get_vif_status(const char *vif, const char *key, char value[BFR_SIZE_64])
 {
     char phy[BFR_SIZE_64];
     char sockdir[BFR_SIZE_64] = "";
@@ -414,7 +415,7 @@ bool hostapd_get_vif_status(const char *vif, const char *key, char *value)
     while ((kv = strsep(&bss_status, "\r\n"))) {
         if ((k = strsep(&kv, "=")) && (v = strsep(&kv, ""))) {
             if (!strcmp(k, key)) {
-                strcpy(value, v);
+                strscpy(value, v, BFR_SIZE_64);
                 LOGI("%s: get %s=%s from hostapd status", vif, key, value);
                 return true;
             }
@@ -428,6 +429,7 @@ int hostapd_chan_switch(const char *phy,
                         int channel,
                         char *center_freq1_str,
                         char *sec_chan_offset_str,
+                        char *punct_bitmap_str,
                         char *opt_chan_info)
 {
     char hostapd_cmd[1024] = "";
@@ -447,17 +449,18 @@ int hostapd_chan_switch(const char *phy,
         freq = util_chan_to_freq_6g(channel);
 
     snprintf(hostapd_cmd, sizeof(hostapd_cmd),
-            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s CHAN_SWITCH %d %d %s %s %s",
+            "timeout -s KILL 3 hostapd_cli -p %s/hostapd-%s -i %s CHAN_SWITCH %d %d %s %s %s %s",
             HOSTAPD_CONTROL_PATH_DEFAULT, phy, vif,
             CHAN_SWITCH_DEFAULT_CS_COUNT,
             freq,
             strlen(center_freq1_str) ? center_freq1_str : "",
             strlen(sec_chan_offset_str) ? sec_chan_offset_str : "",
+            strlen(punct_bitmap_str) ? punct_bitmap_str : "",
             strlen(opt_chan_info) ? opt_chan_info : "");
 
     LOGI("%s: %s", __func__, hostapd_cmd);
 
-    status = !cmd_log(hostapd_cmd);
+    status = !cmd_log_check_safe(hostapd_cmd);
     if (!status) {
         LOGI("hostapd_cli execution failed: %s", hostapd_cmd);
         return -1;

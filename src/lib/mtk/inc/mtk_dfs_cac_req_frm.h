@@ -24,47 +24,20 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#define _GNU_SOURCE
-#include "nl80211.h"
-#include "nl80211_stats.h"
-#include "target_nl80211.h"
+#ifndef MTK_DFS_CAC_REQ_FRM_H_INCLUDED
+#define MTK_DFS_CAC_REQ_FRM_H_INCLUDED
 
-#include <linux/nl80211.h>
-#include <netlink/msg.h>
-#include <netlink/attr.h>
-#include <netlink/socket.h>
-#include <netlink/genl/ctrl.h>
-#include <netlink/genl/genl.h>
-#include <net/if.h>
+#include <cr.h>
+#include <os_types.h>
+#include <stdbool.h>
 
-static int nl80211_txchainmask_recv(struct nl_msg *msg, void *arg)
-{
-    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
-    struct nlattr *tb[NL80211_ATTR_MAX + 1];
-    unsigned int *mask = (unsigned int *)arg;
+typedef struct mtk_dfs_cac_req_frm_fetcher mtk_dfs_cac_req_frm_fetcher_t;
 
-    memset(tb, 0, sizeof(tb));
-    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
-            genlmsg_attrlen(gnlh, 0), NULL);
+mtk_dfs_cac_req_frm_fetcher_t *mtk_dfs_cac_req_frm_fetcher(cr_context_t *ctx, const char *vif_name);
+bool mtk_dfs_cac_req_frm_fetcher_run(mtk_dfs_cac_req_frm_fetcher_t *info);
+void mtk_dfs_cac_req_frm_fetcher_drop(mtk_dfs_cac_req_frm_fetcher_t **info);
+int mtk_dfs_cac_req_frm_fetcher_ch_num(const mtk_dfs_cac_req_frm_fetcher_t *f);
+int mtk_dfs_cac_req_frm_fetcher_cac_active(const mtk_dfs_cac_req_frm_fetcher_t *f);
+size_t mtk_dfs_cac_req_frm_fetcher_len(const mtk_dfs_cac_req_frm_fetcher_t *info);
 
-    if (tb[NL80211_ATTR_WIPHY_ANTENNA_TX])
-        *mask = nla_get_u32(tb[NL80211_ATTR_WIPHY_ANTENNA_TX]);
-
-    return NL_OK;
-}
-
-int nl80211_get_tx_chainmask(char *phyname, unsigned int *mask)
-{
-    struct nl_msg *msg;
-    int phy_idx = -EINVAL;
-
-    if ((phy_idx = util_sys_phyname_to_idx(phyname)) < 0)
-        return -EINVAL;
-
-    msg = nlmsg_init(get_nl_sm_global(), NL80211_CMD_GET_WIPHY, false);
-    if (!msg)
-        return -EINVAL;
-
-    nla_put_u32(msg, NL80211_ATTR_WIPHY, phy_idx);
-    return nlmsg_send_and_recv(get_nl_sm_global(), msg, nl80211_txchainmask_recv, mask);
-}
+#endif /* MTK_DFS_CAC_REQ_FRM_H_INCLUDED */

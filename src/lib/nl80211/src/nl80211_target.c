@@ -39,6 +39,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <net/if.h>
 
 #include "wiphy_info.h"
+#include "util.h"
 
 #define MBM_TO_DBM(gain) ((gain) / 100)
 #define DBM_TO_MBM(gain) ((gain) * 100)
@@ -346,7 +347,7 @@ int nl_resp_parse_channels(struct nl_msg *msg, void *arg)
                 snprintf(temp_buf, sizeof(temp_buf), "chan %d\n", channel);
 
             if ((strlen(buf->buf) + strlen(temp_buf)) < buf->len)
-                strcat(buf->buf, temp_buf);
+                STRSCAT(buf->buf, temp_buf);
             else
                 return NL_SKIP;
         }

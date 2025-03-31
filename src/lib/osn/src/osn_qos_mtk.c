@@ -149,6 +149,7 @@ bool osn_qos_queue_begin(
         osn_qos_t *self,
         int priority,
         int bandwidth,
+        int bandwidth_ceil,
         const char *tag,
         const struct osn_qos_other_config *other_config,
         struct osn_qos_queue_status *qqs)
@@ -169,8 +170,16 @@ bool osn_qos_queue_begin(
     qp = MEM_APPEND(&self->q_id, &self->q_id_e, sizeof(*qp));
     *qp = qid;
 
-    mtk_qos_queue_list[qid].qq_max_rate = bandwidth;
-    mtk_qos_queue_list[qid].qq_min_rate = 0;
+    if (bandwidth_ceil > 0)
+    {
+        mtk_qos_queue_list[qid].qq_max_rate = bandwidth_ceil;
+        mtk_qos_queue_list[qid].qq_min_rate = bandwidth;
+    }
+    else
+    {
+        mtk_qos_queue_list[qid].qq_max_rate = bandwidth;
+        mtk_qos_queue_list[qid].qq_min_rate = 0;
+    }
 
     /* Calculate the MARK for this DPI */
     qqs->qqs_fwmark = MTK_QOS_MARK_BASE | qid;
@@ -179,6 +188,7 @@ bool osn_qos_queue_begin(
         &self->oq_lnx,
         priority,
         bandwidth,
+        bandwidth_ceil,
         tag,
         other_config,
         qqs);
@@ -287,4 +297,21 @@ static void mtk_qos_id_put(int qid)
 
     FREE(mtk_qos_queue_list[qid].qq_tag);
     mtk_qos_queue_list[qid].qq_tag = NULL;
+}
+
+bool osn_qos_notify_event_set(osn_qos_t *self, osn_qos_event_fn_t *event_fn_cb)
+{
+    (void)self;
+    (void)event_fn_cb;
+
+    /*
+     * This implementation backend does not support QoS event reporting.
+     * (There is no need for event reporting on this platform-specific implementation.)
+     */
+    return false;
+}
+
+bool osn_qos_is_qdisc_based(osn_qos_t *self)
+{
+    return false;
 }

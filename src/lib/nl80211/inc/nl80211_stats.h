@@ -28,7 +28,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define NL80211_STATS_H_INCLUDED
 
 #include "nl80211_client.h"
-#include "nl80211_device.h"
 #include "nl80211_scan.h"
 #include "nl80211_survey.h"
 

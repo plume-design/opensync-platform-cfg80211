@@ -49,7 +49,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "nl80211_client.h"
 #include "nl80211_survey.h"
 #include "nl80211_scan.h"
-#include "nl80211_device.h"
 
 #define MODULE_ID LOG_MODULE_ID_TARGET
 
@@ -317,22 +316,6 @@ bool target_stats_device_temp_get(radio_entry_t *radio_cfg,
     temp_entry->value = temperature / 1000;
 
     LOGI("%s: temperature %d", radio_cfg->phy_name, temp_entry->value);
-
-    return true;
-}
-
-bool target_stats_device_txchainmask_get(
-        radio_entry_t              *radio_cfg,
-        dpp_device_txchainmask_t   *txchainmask_entry)
-{
-    txchainmask_entry->type = radio_cfg->type;
-
-    if (nl80211_get_tx_chainmask(radio_cfg->phy_name, &txchainmask_entry->value) < 0) {
-        LOGD("%s: Failed to get tx_chainmask value", radio_cfg->phy_name);
-        return false;
-    }
-
-    LOGI("%s: tx_chainmask %d", radio_cfg->phy_name, txchainmask_entry->value);
 
     return true;
 }

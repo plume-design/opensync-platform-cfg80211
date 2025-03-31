@@ -73,15 +73,16 @@ int util_sys_phyname_to_idx(const char *phyname)
 
 int util_freq_to_chan(int freq)
 {
-    if (freq < 2412)
-        return 0;
-
-    if (freq < 5000)
-        return (1 + ((freq - 2412) / 5));
-    else if (freq < 5950)
-        return ((freq - 5000) / 5);
-    else if (freq < 7130)
-        return ((freq - 5950) / 5);
+    if (freq >= 2412 && freq <= 2472)
+        return (freq - 2407) / 5;
+    else if (freq == 2484)
+        return 14;
+    else if (freq >= 5180 && freq <= 5885)
+        return (freq - 5000) / 5;
+    else if (freq == 5935)
+        return 2;
+    else if (freq >= 5955 && freq <= 7115)
+        return (freq - 5950) / 5;
 
     return 0;
 }
@@ -142,7 +143,7 @@ int util_ht_mode(enum nl80211_chan_width chanwidth, char *ht_mode, int len)
         case NL80211_CHAN_WIDTH_160:
             strscpy(ht_mode, "HT160", len);
             break;
-#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+#if defined(NL80211_CHAN_WIDTH_320)
         case NL80211_CHAN_WIDTH_320:
             strscpy(ht_mode, "HT320", len);
             break;

@@ -279,55 +279,12 @@ forkexec(const char *file, const char **argv, void (*xfrm)(char *), char *buf, i
 }
 
 static int
-util_file_read(const char *path, char *buf, int len)
-{
-    int fd;
-    int err;
-    int errno2;
-    fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return -1;
-    err = read(fd, buf, len);
-    errno2 = errno;
-    close(fd);
-    errno = errno2;
-    return err;
-}
-
-static int
-util_file_write(const char *path, const char *buf, int len)
-{
-    int fd;
-    int err;
-    int errno2;
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        return -1;
-    err = write(fd, buf, len);
-    errno2 = errno;
-    close(fd);
-    errno = errno2;
-    return err;
-}
-
-static int
-util_file_read_str(const char *path, char *buf, int len)
-{
-    int rlen;
-    buf[0] = 0;
-    rlen = util_file_read(path, buf, len);
-    if (rlen < 0)
-        return rlen;
-    buf[rlen] = 0;
-    LOGT("%s: '%s' (%d)", path, buf, rlen);
-    return rlen;
-}
-
-static int
 util_exec_scripts(const char *vif)
 {
     int err;
     char cmd[512];
+
+    if (!is_input_shell_safe(vif)) return -1;
 
     /* FIXME: target_scripts_dir() points to something
      *        different than on WM1. This needs to be
@@ -901,37 +858,6 @@ util_wifi_get_phy_any_vif_type(const char *phy,
     if (!strlen(buf))
         return -1;
 
-    return 0;
-}
-
-static int
-util_wifi_get_phy_all_vifs(const char *phy,
-                       char *buf,
-                       int len)
-{
-    struct dirent *p;
-    char phy_path[BFR_SIZE_256];
-    DIR *d;
-    char *phy_name;
-
-    memset(buf, 0, len);
-
-    snprintf(phy_path, sizeof(phy_path), CONFIG_MAC80211_WIPHY_PATH"/%s/device/net", phy);
-    if (!(d = opendir(phy_path)))
-        return -1;
-
-    for (p = readdir(d); p ; p = readdir(d)) {
-        if (p->d_name && strncmp(p->d_name, ".", 1)) {
-            phy_name = strchomp(R(F(CONFIG_MAC80211_WIPHY_PATH"/%s/device/net/%s/phy80211/name",
-                            phy, p->d_name)), "\r\n ");
-
-            if (!strcmp(phy_name, phy)) {
-                snprintf(buf + strlen(buf), len - strlen(buf), "%s ", p->d_name);
-            }
-        }
-    }
-
-    closedir(d);
     return 0;
 }
 
@@ -1578,6 +1504,8 @@ void set_hostapd_ctrl(const char *vif, const char *phy)
     if (access(F("/var/run/wpa_supplicant-%s", phy), F_OK) < 0)
         return;
 
+    if (!is_input_shell_safe(vif) || !is_input_shell_safe(phy)) return;
+
     cmd = F("timeout -s KILL 3 wpa_cli -p /var/run/wpa_supplicant-%s "
             "hostapd_ctrl /var/run/hostapd-%s/%s", phy, phy, vif);
 
@@ -2081,6 +2009,8 @@ hostap_ctrl_discover(const char *bss)
         hapd->dfs_event_nop_finished = hapd_dfs_event_nop_finished;
         hapd->dfs_event_pre_cac_expired = hapd_dfs_event_pre_cac_expired;
         hapd->ap_csa_finished = hapd_ap_csa_finished;
+        hapd->use_reload_rxkhs = true;
+        hapd->use_rxkh_file = true;
         hapd->respect_multi_ap = 1;
         if (wiphy_info) {
             if (strstr(wiphy_info->mode, "11be")) {
@@ -2344,6 +2274,25 @@ static bool util_get_center_freq0_chan(const char *phy, int *val)
 
     return *val > 0 ? true : false;
 }
+
+static bool util_get_puncture_bitmap(const char *phy, int *val)
+{
+    char ap_vif[BFR_SIZE_64];
+    char puncture_bitmap[BFR_SIZE_64];
+
+    *val = 0;
+
+    if (util_wifi_get_phy_any_vif_type(phy, ap_vif, sizeof(ap_vif), IFNAME_TYPE_AP)) {
+        LOGD("%s: get ap vif failed for puncture_bitmap", phy);
+        return false;
+    }
+
+    if (hostapd_get_vif_status(ap_vif, "punct_bitmap", puncture_bitmap)) {
+        *val = atoi(puncture_bitmap);
+    }
+
+    return *val >= 0 ? true : false;
+}
 #endif
 
 static void util_set_bcn_int(const char *phy, const int bcn_int)
@@ -2478,7 +2427,7 @@ util_hapd_conf_param_get(struct hapd *hapd, struct schema_Wifi_VIF_State *vstate
 }
 
 /******************************************************************************
- * BM and BSAL
+ * BSAL
  *****************************************************************************/
 
 int
@@ -2994,6 +2943,9 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
 #if defined(CONFIG_TARGET_SUPPORT_WIFI7)
     if ((rstate->center_freq0_chan_exists = util_get_center_freq0_chan(phy, &v)))
         rstate->center_freq0_chan = v;
+
+    if ((rstate->puncture_bitmap_exists = util_get_puncture_bitmap(phy, &v)))
+        rstate->puncture_bitmap = v;
 #endif
 
     if ((rstate->mac_exists = (0 == util_net_get_phy_macaddr_str(phy, buf, sizeof(buf)))))
@@ -3072,6 +3024,7 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
     int     center_chan = 0;
     int     center_freq1 = 0;
     char    center_freq1_str[BFR_SIZE_64] = "";
+    char    punct_bitmap_str[BFR_SIZE_64] = "";
     int     ap_vif_curr_chan = 0;
     char    ap_vif_curr_htmode[BFR_SIZE_32] = "";
     char    ap_vif_list[BFR_SIZE_128] = "";
@@ -3124,7 +3077,12 @@ int util_channel_switch(const struct schema_Wifi_Radio_Config *rconf, const char
         }
     }
 
-    return hostapd_chan_switch(phy, vif, rconf->channel, center_freq1_str, sec_chan_offset_str, opt_chan_info);
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+    if (rconf->puncture_bitmap)
+        snprintf(punct_bitmap_str, sizeof(punct_bitmap_str), "punct_bitmap_str=%d", rconf->puncture_bitmap);
+#endif
+
+    return hostapd_chan_switch(phy, vif, rconf->channel, center_freq1_str, sec_chan_offset_str, punct_bitmap_str, opt_chan_info);
 }
 
 bool
@@ -3138,12 +3096,22 @@ is_center_freq0_chan_changed(const struct schema_Wifi_Radio_Config_flags *change
 }
 
 bool
+is_puncture_bitmap_changed(const struct schema_Wifi_Radio_Config_flags *changed) {
+#if defined(CONFIG_TARGET_SUPPORT_WIFI7)
+    return changed->puncture_bitmap;
+#else
+    (void)changed;
+    return false;
+#endif
+}
+
+bool
 target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
                          const struct schema_Wifi_Radio_Config_flags *changed)
 {
     const char *phy = rconf->if_name;
 
-    if ((changed->channel || changed->ht_mode || is_center_freq0_chan_changed(changed))) {
+    if ((changed->channel || changed->ht_mode || is_center_freq0_chan_changed(changed) || is_puncture_bitmap_changed(changed))) {
         if (rconf->channel_exists && rconf->channel > 0 && rconf->ht_mode_exists)
             if (util_channel_switch(rconf, phy) < 0)
                 LOGN("%s: error received while trying to set new channel/ht_mode", __func__);
@@ -3495,11 +3463,6 @@ vif_update:
     ev_async_stop(EV_DEFAULT, async);
 }
 
-void wm_del_unused_iface()
-{
-    runcmd("%s/wm_del_unused_iface.sh", target_bin_dir());
-}
-
 bool
 target_radio_init(const struct target_radio_ops *ops)
 {
@@ -3508,8 +3471,6 @@ target_radio_init(const struct target_radio_ops *ops)
     rops = *ops;
 
     target_radio_config_init_check_runtime();
-
-    wm_del_unused_iface();
 
     if (netlink_wm_init(&target_nl_global)) {
         LOGE("%s: failed to initialize netlink info", __func__);

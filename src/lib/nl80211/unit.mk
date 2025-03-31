@@ -16,7 +16,6 @@ UNIT_SRC += src/nl80211_client.c
 UNIT_SRC += src/nl80211_scan.c
 UNIT_SRC += src/nl80211_survey.c
 UNIT_SRC += src/nl80211_stats.c
-UNIT_SRC += src/nl80211_device.c
 UNIT_SRC += src/nl80211_bsal.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc

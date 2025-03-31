@@ -67,11 +67,13 @@ static const struct {
     { 0x0056, 0x168c, "qcom,ath10k", "qca9886", "Besra"},
     // MTK
     { 0, 0, "mediatek,mt7622-wmac", "mt7622", "MediaTek"},
-    { 0, 0, "mediatek,wbsys", "mt7986", "Filogic830(Panther)"},
+    { 0, 0, "mediatek,mt7981-wmac", "mt7981", "Filogic820(Cheetah)"},
+    { 0, 0, "mediatek,mt7986-wmac", "mt7986", "Filogic830(Panther)"},
     { 0, 0, "mediatek,mt7988-wbsys", "mt7988", "Filogic880(Jaguar)"},
     { 0x7615, 0x14c3, 0, "mt7615", "MediaTek"},
     { 0x7915, 0x14c3, 0, "mt7915", "Filogic615(Harrier)"},
     { 0x7906, 0x14c3, "ecnt,pcie-ecnt", "mt7916", "Filogic630(Merlin)"},
+    { 0x7992, 0x14c3, 0, "mt7992", "Filogic660(Kite)"},
     { 0x7990, 0x14c3, 0, "mt7996", "Filogic680(Eagle)"},
 };
 
@@ -80,6 +82,24 @@ static struct wiphy_info g_wiphys[4];
 static char g_wiphy_2ghz_ifname[64];
 
 /* helpers */
+static bool
+identify_dtcompat(char *buf_dtcompat,
+                  size_t num_dtcompat,
+                  int *offset_dtcompat,
+                  const char *chip_dtcompat)
+{
+    char *dtcompat;
+    size_t i;
+
+    for (i = 0; i < num_dtcompat; i++) {
+        dtcompat = buf_dtcompat + offset_dtcompat[i];
+        if (!strcmp(dtcompat, chip_dtcompat))
+            return true;
+    }
+
+    return false;
+}
+
 static int
 identify_chip(const char *phyname,
               const char **chip,
@@ -89,8 +109,10 @@ identify_chip(const char *phyname,
     unsigned short vendor;
     const char *buf_device;
     const char *buf_vendor;
-    const char *buf_dtcompat;
-    const char *dtcompat;
+    char buf_dtcompat[1024];
+    size_t num_dtcompat = 0;
+    int offset_dtcompat[8] = {0};
+    char *dtcompat;
     char path_base[64];
     char path_device[64];
     char path_vendor[64];
@@ -131,23 +153,33 @@ identify_chip(const char *phyname,
 
     buf_device = strexa("cat", path_device) ?: "0";
     buf_vendor = strexa("cat", path_vendor) ?: "0";
-    buf_dtcompat = strexa("cat", path_dtcompat) ?: "";
     device = strtol(buf_device, 0, 16);
     vendor = strtol(buf_vendor, 0, 16);
-    dtcompat = buf_dtcompat;
 
     LOGD("%s: is_da_maybe: %d", phyname, is_da_maybe ? 1 : 0);
     LOGD("%s: device: '%s' => '%s' (%hu)", phyname, path_device, buf_device, device);
     LOGD("%s: vendor: '%s' => '%s' (%hu)", phyname, path_vendor, buf_vendor, vendor);
-    LOGD("%s: dtcompat: '%s' => '%s'", phyname, path_dtcompat, buf_dtcompat);
 
-    if (strlen(dtcompat) <= 0)
-        dtcompat = NULL;
+    FILE *f = fopen(path_dtcompat, "r");
+    if (f != NULL) {
+        size_t nread = fread(buf_dtcompat, 1, sizeof(buf_dtcompat), f);
+        fclose(f);
+        for (i = 0; i < nread; i++) {
+            if (buf_dtcompat[i] == '\0') {
+                num_dtcompat++;
+                offset_dtcompat[num_dtcompat] = i + 1;
+            }
+        }
+        for (i = 0; i < num_dtcompat; i++) {
+            dtcompat = buf_dtcompat + offset_dtcompat[i];
+            LOGD("%s: dtcompat: '%s' => '%s'", phyname, path_dtcompat, dtcompat);
+        }
+    }
 
     for (i = 0; i < ARRAY_SIZE(g_chips); i++) {
-        if (dtcompat) {
+        if (num_dtcompat) {
             if (g_chips[i].dtcompat &&
-                !strcmp(dtcompat, g_chips[i].dtcompat))
+                identify_dtcompat(buf_dtcompat, num_dtcompat, offset_dtcompat, g_chips[i].dtcompat))
                 break;
         } else {
             if (device == g_chips[i].device &&
@@ -257,11 +289,13 @@ wiphy_info_init_ifname(struct nl_global_info *nl_global, const char *phyname)
     if (WARN_ON(!info->band))
         return -1;
 
-    if (!strcmp(info->chip, "mt7996")) {
+    if (!strcmp(info->chip, "mt7992") ||
+        !strcmp(info->chip, "mt7996")) {
         // Wifi 7
         info->mode = "11be";
     } else if (!strcmp(info->chip, "mt7915") ||
                !strcmp(info->chip, "mt7916") ||
+               !strcmp(info->chip, "mt7981") ||
                !strcmp(info->chip, "mt7986")) {
         // Wifi 6/6E
         info->mode = "11ax";

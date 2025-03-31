@@ -301,8 +301,8 @@ static bool osn_mld_write_config(osn_mld_t *self)
     fprintf(f, "};\n");
 
     /* Specify instance rule matching statement */
-    fprintf(f, "pinstance proxy_MLDv%c downstream \"%s\" in blacklist table allways;\n",
-            mld_version, proxy_downstream_if);
+    //fprintf(f, "pinstance proxy_MLDv%c downstream \"%s\" in blacklist table allways;\n",
+    //        mld_version, proxy_downstream_if);
 
     fclose(f);
 

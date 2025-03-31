@@ -308,13 +308,13 @@ static bool osn_igmp_write_config(osn_igmp_t *self)
             proxy_upstream_if, proxy_downstream_if);
 
     /* Specify filter table */
-    fprintf(f, "table allways {\n");
-    fprintf(f, "         (*|*)\n");
+    fprintf(f, "table lanonly {\n");
+    fprintf(f, "         (*|239.255.255.250)\n");
     fprintf(f, "};\n");
 
     /* Specify instance rule matching statement */
-    //fprintf(f, "pinstance proxy_IGMPv%c downstream \"%s\" in blacklist table allways;\n",
-    //        igmp_version, proxy_downstream_if);
+    fprintf(f, "pinstance proxy_IGMPv%c downstream \"%s\" in blacklist table lanonly;\n",
+        igmp_version, proxy_downstream_if);
 
     fclose(f);
 

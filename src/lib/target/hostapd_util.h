@@ -32,6 +32,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdbool.h>
 #include <string.h>
 #include "kconfig.h"
+#include "os_common.h"
 
 #define HOSTAPD_CONTROL_PATH_DEFAULT "/var/run"
 #define EXEC(...) strexa(__VA_ARGS__)
@@ -96,7 +97,7 @@ int hostapd_mac_acl_clear(const char *phy, const char *vif);
 
 bool hostapd_set_bcn_int(const char *phy, const char *vif, const int bcn_int);
 bool hostapd_vif_reload(const char *phy, const char *vif);
-bool hostapd_get_vif_status(const char *vif, const char *key, char *value);
+bool hostapd_get_vif_status(const char *vif, const char *key, char value[BFR_SIZE_64]);
 
 int hostapd_chan_switch(
         const char *phy,
@@ -104,6 +105,7 @@ int hostapd_chan_switch(
         int channel,
         char *center_freq1_str,
         char *sec_chan_offset_str,
+        char *punct_bitmap_str,
         char *opt_chan_info
 );
 
