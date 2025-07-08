@@ -1,5 +1,7 @@
 OS_CFLAGS += -I$(STAGING_DIR)/usr/include/protobuf-c
 
+SDK_DIR        = $(TOPDIR)
+SDK_BASE       = $(TOPDIR)/..
 CC             = $(TOOLCHAIN_DIR)/bin/$(TOOLCHAIN_PREFIX)gcc
 CXX            = $(TOOLCHAIN_DIR)/bin/$(TOOLCHAIN_PREFIX)g++
 AR             = $(TOOLCHAIN_DIR)/bin/$(TOOLCHAIN_PREFIX)ar

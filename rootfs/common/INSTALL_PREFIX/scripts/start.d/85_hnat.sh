@@ -41,14 +41,22 @@ HNAT_CONFIG=hnat_setting
 #               6     0~255      Set UDP keep alive interval
 #               7     0~1        Set hnat counter update to nf_conntrack
 #               8     0~6        Set PPE hash debug mode
-#               9     0~4G       Set hnat counter update interval in ms (0 disabled)
+#               9     0~2G       Set hnat counter update interval in ms (0 disabled)
+#               10    0~4G       Only effective if hnat counter update interval > 0 then update lanX
+#                                interfaces flags: 0=disabled, 1=lan0, 2=lan1, 4=lan2 3=lan1+lan2...
 
 if [ -e  $HNAT_DIR/$HNAT_CONFIG ]; then
+	#ensure hnat update call to kernel
 	echo 7 0 > $HNAT_DIR/$HNAT_CONFIG
 
+	#ensure hnat connection lifetime is greater than update time.
 	echo 2 2 > $HNAT_DIR/$HNAT_CONFIG
 	echo 3 2 > $HNAT_DIR/$HNAT_CONFIG
 	echo 4 2 > $HNAT_DIR/$HNAT_CONFIG
 
+	#enable hnat stats to ct (and interface) every 1s
 	echo 9 1000 > $HNAT_DIR/$HNAT_CONFIG
+
+	#update lan0~lan3 ports
+	echo 10 15 > $HNAT_DIR/$HNAT_CONFIG
 fi

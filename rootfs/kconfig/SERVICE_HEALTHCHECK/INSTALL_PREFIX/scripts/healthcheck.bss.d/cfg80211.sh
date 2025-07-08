@@ -24,6 +24,13 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Checks if BSS is up using platform-specific tools.
+#
+# 1. Ensures the VAP is managed by the driver
+# 2. Checks if channels are available in this regulatory domain
+# 3. Validates the presence of the association by checking AP's SSID
+
+
 vap=$1
 
 if ! iw dev $vap info >/dev/null 2>/dev/null
@@ -31,6 +38,7 @@ then
     # Possibly handled by a different driver.
     exit 0
 fi
+
 
 out_of_channels()
 {
@@ -49,17 +57,25 @@ then
     exit 0
 fi
 
-# An AP must have an SSID. If there's no SSID the AP cannot be beaconing.
+
 if ! iw "$vap" info | grep -q "ssid "
 then
-    log_warn "$vap: no ssid in iw info output: AP is not beaconing"
+    log_warn "$vap: no ssid in iw info output: AP is not beaconing/STA is not associated"
     exit 1
 fi
 
-if ! timeout 1 hostapd_cli -i "$vap" status | grep -q "state=ENABLED"
-then
-    log_warn "$vap: state in hostapd_cli status is not ENABLED"
-    exit 1
+vap_type=$(iw "$vap" info | grep "type" | awk '{print $2}')
+
+if [ "$vap_type" = "AP" ]; then
+    if ! timeout 1 hostapd_cli -i "$vap" status | grep -q "state=ENABLED"; then
+        log_warn "$vap: state in hostapd_cli status is not ENABLED"
+        exit 1
+    fi
+else
+    if ! timeout 1 wpa_cli -i "$vap" status | grep -q "wpa_state=COMPLETED"; then
+        log_warn "$vap: wpa_state in wpa_cli status is not COMPLETED"
+        exit 1
+    fi
 fi
 
 exit 0

@@ -271,6 +271,16 @@ end:
 }
 
 static void
+osw_plat_logan_conf_vif_ap_bcn_int(struct osw_drv_vif_config *vif)
+{
+    struct osw_drv_vif_config_ap *ap = &vif->u.ap;
+    if (ap->beacon_interval_tu_changed == false) return;
+
+    const char *vif_name = vif->vif_name;
+    WARN_ON(strexa("mwctl", "dev", vif_name, "set", "beacon_int", strfmta("%d", ap->beacon_interval_tu)) == NULL);
+}
+
+static void
 osw_plat_logan_conf_vif_ap_acl(struct osw_drv_phy_config *phy,
                              struct osw_drv_vif_config *vif)
 {
@@ -327,6 +337,7 @@ osw_plat_cfg80211_conf_each_vif(struct osw_drv_phy_config *phy,
             if (osw_plat_cfg80211_has_mwctl(phy->phy_name)) {
                 osw_plat_logan_conf_vif_ap_acl_policy(phy, vif);
                 osw_plat_logan_conf_vif_ap_acl(phy, vif);
+                osw_plat_logan_conf_vif_ap_bcn_int(vif);
             }
             break;
         case OSW_VIF_AP_VLAN:
